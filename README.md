@@ -52,13 +52,10 @@ Robocopy 使用 `/COPY:DAT /DCOPY:DAT`，保留文件与目录的数据、属性
 
 如果工具报告自动回滚未完成，优先检查日志给出的备份与目标路径。不要直接清空其中任何一个目录。
 
-## 日志与组件
+## 文件、日志与项目说明
 
-- `migrate-local-folders.ps1`：普通权限 WinForms 主窗口、直接拖放、映射预览、Worker 管道客户端和状态显示。
-- `migration-worker.ps1`：单次 UAC 启动后常驻的提权 Worker；校验同用户命名管道及对端进程 PID，并以子进程调用固定迁移引擎。
-- `migration-engine.ps1`：可独立运行的 Analyze/Migrate 引擎；执行预检、复制、校验、备份改名、建链和恢复。
-- `migrate-local-folders.cmd`：隐藏 PowerShell 控制台并启动唯一的普通权限主窗口；提权只发生在首次预检时。
-- `DESIGN.md`：模块关系、安全边界和状态流程。
-- `operation-notes.md`：2026-09-27 那次实际迁移的历史记录。
+完整的仓库文件索引、运行调用链和代码审查摘要见 [`PROJECT_OVERVIEW.md`](PROJECT_OVERVIEW.md)。
+
+程序运行入口是 `migrate-local-folders.cmd`；主窗口由 `migrate-local-folders.ps1` 提供，提权任务经 `migration-worker.ps1` 转交给 `migration-engine.ps1`。`README.md` 是使用指南，`DESIGN.md` 记录架构与安全决策。以 `PLAN_` 或 `plan-` 开头的文件是方案/实现记录，`operation-notes.md` 是历史迁移记录；这些文件都不是运行入口，也不会自动成为迁移作业清单。
 
 每次任务的引擎和 Robocopy 日志保存在 `%TEMP%\mklinktool-<任务编号>`。窗口的“打开日志目录”按钮可直接打开。
