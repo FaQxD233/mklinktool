@@ -8,7 +8,7 @@
 
 ## 启动
 
-双击 `migrate-local-folders.cmd` 后，启动器会打开管理员主窗口，并同时打开一个普通权限的拖放接收窗口。由于 Windows 的权限隔离，普通资源管理器不能直接把文件夹拖入管理员窗口；请拖入配套接收窗口，检查列表后点击“添加到管理员主窗口”。拖放只传递来源路径，不会复制或移动文件。工具只创建目录符号链接 `SymbolicLink`（对应 `mklink /d`）。引擎会先创建临时测试链接检查能力；检查失败就不会开始复制。
+双击 `migrate-local-folders.cmd` 后会打开唯一的普通权限主窗口。把资源管理器中的一个或多个文件夹直接拖进窗口或来源列表即可；拖放只导入路径，不会复制或移动文件。首次点击“扫描并预检”时，工具请求一次 UAC 并启动隐藏的提权 Worker；预检和随后迁移共用该 Worker，直到主窗口关闭。Worker 意外退出后再次操作时可能需要重新确认 UAC。工具只创建目录符号链接 `SymbolicLink`（对应 `mklink /d`）。引擎会先创建临时测试链接检查能力；检查失败就不会开始复制。
 
 项目不需要安装第三方模块。GUI 和迁移引擎均使用 Windows 自带的 Windows PowerShell 5.1、WinForms 和 Robocopy。
 
@@ -20,7 +20,7 @@ PowerShell 5.1 文件系统提供者支持 `SymbolicLink`；微软文档说明 W
 2. 选择目标结构：
    - 平铺：`<目标根目录>\<来源目录名>`。
    - 分类：`<目标根目录>\<来源父目录名小写或盘符>-<来源目录名><yymmdd>\<来源目录名>`。例如 `C:\Users\Kari\AppData\Local\Example` 会生成为 `local-Example260927\Example`，`C:\Users\Kari\AppData\Roaming\Example` 会生成为 `roaming-Example260927\Example`；`C:\Example` 会生成为 `c-Example260927\Example`，`C:\Kari\Example` 会生成为 `kari-Example260927\Example`。日期使用运行当天的 `yyMMdd`。
-3. 逐个添加来源目录，或在配套拖放接收窗口中收集多个文件夹后一次添加。来源表格支持 Ctrl/Shift 多选；右键来源路径或目标路径可打开目录、复制路径或移除选中项。表格显示预估文件数、数据量和最终目标绝对路径；目标路径可在表格中修改。
+3. 逐个添加来源目录，或从资源管理器一次拖入多个文件夹。来源表格支持 Ctrl/Shift 多选；右键来源路径或目标路径可打开目录、复制路径或移除选中项。表格显示预估文件数、数据量和最终目标绝对路径；目标路径可在表格中修改。
 4. 默认使用较快的 Robocopy 结果、相对文件路径、文件数和总字节数校验。需要逐文件内容校验时勾选 SHA-256；大目录会明显增加读取时间。
 5. 点击“扫描并预检”。来源根重解析点、外部/损坏链接、文件链接和未知重解析点会被拦截；来源内部目标仍位于来源根内的目录 Junction 和目录 SymbolicLink 会作为警告显示，并保留其链接类型。
 6. 检查表格中的内部 Junction/符号链接数量，以及日志中的链接警告，再点击“开始迁移”。确认框会说明备份清理选择和绝对链接对原来源根链接的依赖。
@@ -54,9 +54,10 @@ Robocopy 使用 `/COPY:DAT /DCOPY:DAT`，保留文件与目录的数据、属性
 
 ## 日志与组件
 
-- `migrate-local-folders.ps1`：WinForms 选择器、映射预览、异步任务启动和状态显示。
+- `migrate-local-folders.ps1`：普通权限 WinForms 主窗口、直接拖放、映射预览、Worker 管道客户端和状态显示。
+- `migration-worker.ps1`：单次 UAC 启动后常驻的提权 Worker；校验同用户命名管道及对端进程 PID，并以子进程调用固定迁移引擎。
 - `migration-engine.ps1`：可独立运行的 Analyze/Migrate 引擎；执行预检、复制、校验、备份改名、建链和恢复。
-- `migrate-local-folders.cmd`：启动同用户权限的拖放接收窗、提升管理员主窗口并记录启动器日志。`migrate-local-folders-drop-receiver.ps1`：在普通权限下收集拖入的目录，通过本次会话临时收件箱把路径交给主窗口。
+- `migrate-local-folders.cmd`：隐藏 PowerShell 控制台并启动唯一的普通权限主窗口；提权只发生在首次预检时。
 - `DESIGN.md`：模块关系、安全边界和状态流程。
 - `operation-notes.md`：2026-09-27 那次实际迁移的历史记录。
 
