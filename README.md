@@ -19,7 +19,7 @@ PowerShell 5.1 文件系统提供者支持 `SymbolicLink`；微软文档说明 W
 1. 选择目标根目录。
 2. 选择目标结构：
    - 平铺：`<目标根目录>\<来源目录名>`。
-   - 分类：`<目标根目录>\<来源父目录名小写或盘符>-<来源目录名><yymmdd>\<来源目录名>`。例如 `C:\Users\Kari\AppData\Local\Example` 会生成为 `local-Example260927\Example`，`C:\Users\Kari\AppData\Roaming\Example` 会生成为 `roaming-Example260927\Example`；`C:\Example` 会生成为 `c-Example260927\Example`，`C:\Kari\Example` 会生成为 `kari-Example260927\Example`。日期使用运行当天的 `yyMMdd`。
+   - 分类：`<目标根目录>\<来源父目录名小写或盘符>-<来源目录名><yymmdd>\<来源目录名>`。例如 `%USERPROFILE%\AppData\Local\Example` 会生成为 `local-Example<yyMMdd>\Example`，`%USERPROFILE%\AppData\Roaming\Example` 会生成为 `roaming-Example<yyMMdd>\Example`；`C:\Example` 会生成为 `c-Example<yyMMdd>\Example`，`C:\Projects\Example` 会生成为 `projects-Example<yyMMdd>\Example`。日期使用运行当天的 `yyMMdd`。
 3. 逐个添加来源目录，或从资源管理器一次拖入多个文件夹。来源表格支持 Ctrl/Shift 多选；右键来源路径或目标路径可打开目录、复制路径或移除选中项。表格显示预估文件数、数据量和最终目标绝对路径；目标路径可在表格中修改。
 4. 默认使用较快的 Robocopy 结果、相对文件路径、文件数和总字节数校验。需要逐文件内容校验时勾选 SHA-256；大目录会明显增加读取时间。
 5. 点击“扫描并预检”。来源根重解析点、外部/损坏链接、文件链接和未知重解析点会被拦截；来源内部目标仍位于来源根内的目录 Junction 和目录 SymbolicLink 会作为警告显示，并保留其链接类型。
