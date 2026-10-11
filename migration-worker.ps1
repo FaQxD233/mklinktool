@@ -1,4 +1,4 @@
-param(
+﻿param(
     [Parameter(Mandatory = $true)]
     [ValidatePattern('^mklinktool-pipe-[a-fA-F0-9]{32}$')]
     [string]$PipeName,
@@ -52,20 +52,28 @@ function Wait-EngineExit([System.Diagnostics.Process]$EngineProcess, [System.Dia
     return $parentEnded
 }
 
-function Resolve-SessionPath([string]$Path) {
+function Resolve-SessionPath([string]$Path, [string]$TempRoot) {
+    if ([string]::IsNullOrWhiteSpace($TempRoot)) {
+        throw 'The request is missing the main window temp root.'
+    }
     $fullPath = [System.IO.Path]::GetFullPath($Path)
-    $tempRoot = [System.IO.Path]::GetFullPath([System.IO.Path]::GetTempPath()).TrimEnd('\')
+    $expectedRoot = [System.IO.Path]::GetFullPath($TempRoot).TrimEnd('\')
     $directory = [System.IO.DirectoryInfo]::new($fullPath)
     if ($null -eq $directory.Parent -or
-        -not [string]::Equals($directory.Parent.FullName.TrimEnd('\'), $tempRoot, [System.StringComparison]::OrdinalIgnoreCase) -or
+        -not [string]::Equals($directory.Parent.FullName.TrimEnd('\'), $expectedRoot, [System.StringComparison]::OrdinalIgnoreCase) -or
         -not ($directory.Name -match '^mklinktool-[a-fA-F0-9]{32}$')) {
-        throw 'The job session must be a direct GUID-named child of the current user temp directory.'
+        throw 'The job session must be a direct GUID-named child of the main window temp directory.'
     }
     if (-not [System.IO.Directory]::Exists($fullPath)) { throw 'The job session directory does not exist.' }
     if (([System.IO.File]::GetAttributes($fullPath) -band [System.IO.FileAttributes]::ReparsePoint) -ne 0) {
         throw 'The job session directory cannot be a reparse point.'
     }
     return $fullPath
+}
+
+function ConvertTo-ProcessArgument([string]$Value) {
+    # 以双引号包裹并双写内嵌引号，防止路径破坏 -File 参数边界。
+    return '"' + $Value.Replace('"', '""') + '"'
 }
 
 $identity = [System.Security.Principal.WindowsIdentity]::GetCurrent()
@@ -129,7 +137,7 @@ try {
             $action = [string]$request.Action
             if ($action -notin @('Analyze', 'Migrate')) { throw 'Unsupported engine action.' }
 
-            $sessionPath = Resolve-SessionPath ([string]$request.SessionPath)
+            $sessionPath = Resolve-SessionPath ([string]$request.SessionPath) ([string]$request.SessionTempRoot)
             $configPath = Join-Path $sessionPath 'job.json'
             $statePath = Join-Path $sessionPath 'state.json'
             $logPath = Join-Path $sessionPath 'engine.log'
@@ -153,7 +161,13 @@ try {
             $enginePath = Join-Path $PSScriptRoot 'migration-engine.ps1'
             if (-not [System.IO.File]::Exists($enginePath)) { throw 'The migration engine script is missing.' }
             $powershellPath = Join-Path $env:WINDIR 'System32\WindowsPowerShell\v1.0\powershell.exe'
-            $arguments = '-NoLogo -NoProfile -ExecutionPolicy Bypass -File "{0}" -Action {1} -ConfigPath "{2}" -StatePath "{3}" -LogPath "{4}" -RobocopyLogPath "{5}"' -f $enginePath, $action, $configPath, $statePath, $logPath, $robocopyLogPath
+            $arguments = '-NoLogo -NoProfile -ExecutionPolicy Bypass -File {0} -Action {1} -ConfigPath {2} -StatePath {3} -LogPath {4} -RobocopyLogPath {5}' -f @(
+                (ConvertTo-ProcessArgument $enginePath),
+                $action,
+                (ConvertTo-ProcessArgument $configPath),
+                (ConvertTo-ProcessArgument $statePath),
+                (ConvertTo-ProcessArgument $logPath),
+                (ConvertTo-ProcessArgument $robocopyLogPath))
             $engineProcess = Start-Process -FilePath $powershellPath -ArgumentList $arguments -PassThru -WindowStyle Hidden
             Send-Message $writer @{ Type = 'Accepted'; RequestId = $requestId; Action = $action; EnginePid = $engineProcess.Id; EngineStartTime = $engineProcess.StartTime.ToFileTime() }
 
