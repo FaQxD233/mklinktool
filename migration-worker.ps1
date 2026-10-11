@@ -36,6 +36,22 @@ function Test-ParentAlive([System.Diagnostics.Process]$ParentProcess) {
     }
 }
 
+function Wait-EngineExit([System.Diagnostics.Process]$EngineProcess, [System.Diagnostics.Process]$ParentProcess) {
+    $parentEnded = $false
+    $parentEndedAt = $null
+    while (-not $EngineProcess.WaitForExit(1000)) {
+        if (-not (Test-ParentAlive $ParentProcess)) {
+            if (-not $parentEnded) {
+                $parentEnded = $true
+                $parentEndedAt = [DateTime]::UtcNow
+            }
+            # 主窗口已退出且引擎超过一小时仍未退出时，放弃等待并让引擎自行继续；不强制终止引擎。
+            if ([DateTime]::UtcNow -gt $parentEndedAt.AddMinutes(60)) { break }
+        }
+    }
+    return $parentEnded
+}
+
 function Resolve-SessionPath([string]$Path) {
     $fullPath = [System.IO.Path]::GetFullPath($Path)
     $tempRoot = [System.IO.Path]::GetFullPath([System.IO.Path]::GetTempPath()).TrimEnd('\')
@@ -139,22 +155,27 @@ try {
             $powershellPath = Join-Path $env:WINDIR 'System32\WindowsPowerShell\v1.0\powershell.exe'
             $arguments = '-NoLogo -NoProfile -ExecutionPolicy Bypass -File "{0}" -Action {1} -ConfigPath "{2}" -StatePath "{3}" -LogPath "{4}" -RobocopyLogPath "{5}"' -f $enginePath, $action, $configPath, $statePath, $logPath, $robocopyLogPath
             $engineProcess = Start-Process -FilePath $powershellPath -ArgumentList $arguments -PassThru -WindowStyle Hidden
-            Send-Message $writer @{ Type = 'Accepted'; RequestId = $requestId; Action = $action; EnginePid = $engineProcess.Id }
+            Send-Message $writer @{ Type = 'Accepted'; RequestId = $requestId; Action = $action; EnginePid = $engineProcess.Id; EngineStartTime = $engineProcess.StartTime.ToFileTime() }
 
-            $parentEnded = $false
-            while (-not $engineProcess.WaitForExit(1000)) {
-                if (-not (Test-ParentAlive $parentProcess)) { $parentEnded = $true }
-            }
+            $parentEnded = Wait-EngineExit $engineProcess $parentProcess
             $engineProcess.Refresh()
 
+            $engineExitCode = $null
+            if ($engineProcess.HasExited) { $engineExitCode = $engineProcess.ExitCode }
             $result = [ordered]@{
                 Version = 1
                 RequestId = $requestId
                 Action = $action
                 EnginePid = $engineProcess.Id
-                ExitCode = $engineProcess.ExitCode
+                ExitCode = $engineExitCode
                 ParentEnded = $parentEnded
                 CompletedUtc = [DateTime]::UtcNow.ToString('o')
+            }
+            foreach ($resultFilePath in @($temporaryResultPath, $resultPath)) {
+                if ([System.IO.File]::Exists($resultFilePath) -and
+                    (([System.IO.File]::GetAttributes($resultFilePath) -band [System.IO.FileAttributes]::ReparsePoint) -ne 0)) {
+                    throw 'A result output path became a reparse point before writing.'
+                }
             }
             [System.IO.File]::WriteAllText($temporaryResultPath, ($result | ConvertTo-Json -Depth 4), $utf8)
             [System.IO.File]::Move($temporaryResultPath, $resultPath)
@@ -163,7 +184,7 @@ try {
         } catch {
             if ($null -ne $engineProcess) {
                 try {
-                    while (-not $engineProcess.WaitForExit(1000)) { }
+                    [void](Wait-EngineExit $engineProcess $parentProcess)
                     $engineProcess.Dispose()
                 } catch { }
                 $shouldStop = $true
