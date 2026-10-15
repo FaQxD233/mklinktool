@@ -23,6 +23,8 @@ $script:WorkerRequestId = ''
 $script:WorkerResultPath = ''
 $script:WorkerEnginePid = 0
 $script:WorkerEngineStartTime = ''
+# 没收到 Worker 的任务确认、只能凭结果文件跟踪任务时，加在状态栏进度文字前的说明。
+$script:WorkerStatusPrefix = ''
 $script:WorkerReadTimeoutMs = 30000
 $script:WorkerState = $null
 $script:WorkerStatePath = ''
@@ -479,15 +481,14 @@ function Read-WorkerMessage {
     $readTask = $script:WorkerReader.ReadLineAsync()
     try {
         if (-not $readTask.Wait($script:WorkerReadTimeoutMs)) {
-            # 超时后挂起的异步读会让 StreamReader 一直处于“in use”状态，
-            # 同一连接上的后续读取必然失败；必须丢弃整个 Worker 连接，
-            # 让下次操作通过 Connect-ElevatedWorker 完整重建。
-            Close-ElevatedWorker
-            throw '等待提权 Worker 消息超时；已断开 Worker 连接，请重新操作（可能需要重新确认 UAC）。'
+            # 超时后挂起的异步读会让 StreamReader 一直处于“in use”状态，同一连接上的后续读取必然失败，
+            # 必须断开连接（下次操作由 Connect-ElevatedWorker 重建）。Worker 进程对象保留，供调用方判断它何时退出。
+            Close-WorkerConnection
+            throw '等待提权 Worker 回复超时。'
         }
     } catch [System.AggregateException] {
-        Close-ElevatedWorker
-        throw '提权 Worker 连接发生错误；已断开连接，请重新操作（可能需要重新确认 UAC）。'
+        Close-WorkerConnection
+        throw '提权 Worker 连接发生错误。'
     }
     $line = $readTask.Result
     if ($null -eq $line) { throw '提权 Worker 已断开连接。' }
@@ -601,31 +602,34 @@ function Connect-ElevatedWorker {
 }
 
 function Stop-WorkerProcess([System.Diagnostics.Process]$Process) {
+    # 只用于空闲的 Worker（窗口关闭、连接已失效）或尚未接手任务的 Worker（握手失败），先等它自行退出。
+    # 非提权的主窗口按完整性级别无法终止提权进程，taskkill 只在主窗口本身已提权时才会生效；
+    # 不带 /T，即使 Worker 意外仍有引擎子进程，也不强制终止可能正在复制或切换源路径的引擎。
     try {
         if ($Process.HasExited -or $Process.WaitForExit(3000)) { return }
-        # 先尝试 taskkill /T 连同子进程（引擎）一起终止，避免引擎成为孤儿进程继续改写目录。
         $taskkill = Join-Path $env:WINDIR 'System32\taskkill.exe'
         if ([System.IO.File]::Exists($taskkill)) {
-            try {
-                & $taskkill /PID $Process.Id /T /F 2>&1 | Out-Null
-                try { [void]$Process.WaitForExit(3000) } catch { }
-                $Process.Refresh()
-            } catch { }
-            if ($Process.HasExited) { return }
+            # taskkill 失败时会写 stderr，在 Stop 偏好下会变成终止错误，必须单独捕获。
+            try { & $taskkill /PID $Process.Id /F 2>&1 | Out-Null } catch { }
+            if ($Process.WaitForExit(1000)) { return }
         }
+        $message = '提权 Worker 未能被终止（权限不足）；它会在读到管道关闭后自行退出。'
         try {
-            $Process.Kill()
-            try { [void]$Process.WaitForExit(3000) } catch { }
-        } catch {
-            # 普通权限进程通常无权终止经 UAC 提权的 Worker（权限受限）。
-            # Worker 会在当前引擎任务结束后、管道断开时或 60 分钟宽限后自行退出。
-            $message = '提权 Worker 未能被终止（权限受限）；它将在当前任务结束后自行退出。'
-            try {
-                if ($null -ne $logTextBox) { $logTextBox.AppendText($message + [Environment]::NewLine) }
-                if ($null -ne $statusLabel) { $statusLabel.Text = $message }
-            } catch { }
-        }
+            if ($null -ne $logTextBox) { $logTextBox.AppendText($message + [Environment]::NewLine) }
+            if ($null -ne $statusLabel) { $statusLabel.Text = $message }
+        } catch { }
     } catch { }
+}
+
+function Close-WorkerConnection {
+    # 只断开管道、保留 Worker 进程对象：Worker 做完手头的任务后读到管道关闭就会退出，调用方可据此判断任务是否结束。
+    if ($null -ne $script:WorkerWriter) { try { $script:WorkerWriter.Dispose() } catch { } }
+    if ($null -ne $script:WorkerReader) { try { $script:WorkerReader.Dispose() } catch { } }
+    if ($null -ne $script:WorkerPipe) { try { $script:WorkerPipe.Dispose() } catch { } }
+    $script:WorkerPipe = $null
+    $script:WorkerReader = $null
+    $script:WorkerWriter = $null
+    $script:WorkerPipeName = ''
 }
 
 function Close-ElevatedWorker {
@@ -637,18 +641,12 @@ function Close-ElevatedWorker {
         } catch { }
     }
 
-    if ($null -ne $script:WorkerWriter) { $script:WorkerWriter.Dispose() }
-    if ($null -ne $script:WorkerReader) { $script:WorkerReader.Dispose() }
-    if ($null -ne $script:WorkerPipe) { $script:WorkerPipe.Dispose() }
+    Close-WorkerConnection
     if ($null -ne $script:Worker) {
         Stop-WorkerProcess $script:Worker
         $script:Worker.Dispose()
     }
     $script:Worker = $null
-    $script:WorkerPipe = $null
-    $script:WorkerReader = $null
-    $script:WorkerWriter = $null
-    $script:WorkerPipeName = ''
 }
 
 function Get-CleanupCandidates {
@@ -744,6 +742,46 @@ function Complete-WorkerAction([int]$ExitCode, [string]$Message = '') {
     $script:WorkerResultPath = ''
     $script:WorkerEnginePid = 0
     $script:WorkerEngineStartTime = ''
+    $script:WorkerStatusPrefix = ''
+}
+
+function Enter-WorkerTask([string]$Action, [object[]]$Items, [string]$JournalPath, [string]$RequestId, [string]$SessionPath, [int]$EnginePid, [string]$EngineStartTime, [string]$LostReplyReason) {
+    # 把界面切换到“任务进行中”：锁定会改动作业的控件，由计时器轮询会话目录直到任务结束。
+    # $LostReplyReason 非空表示没收到 Worker 的任务确认，只能凭结果文件以及 Worker、引擎进程是否还在来判断任务何时结束。
+    $script:WorkerAction = $Action
+    $script:WorkerItems = $Items
+    $script:WorkerJournalPath = $JournalPath
+    $script:WorkerRequestId = $RequestId
+    $script:WorkerSessionPath = $SessionPath
+    $script:WorkerStatePath = Join-Path $SessionPath 'state.json'
+    $script:WorkerLogPath = Join-Path $SessionPath 'engine.log'
+    $script:WorkerResultPath = Join-Path $SessionPath ('result-{0}.json' -f $RequestId)
+    $script:WorkerEnginePid = $EnginePid
+    $script:WorkerEngineStartTime = $EngineStartTime
+    $script:WorkerState = $null
+    $script:LogBytesShown = 0
+    $script:ActiveJob = $true
+    $trackingOnly = -not [string]::IsNullOrEmpty($LostReplyReason)
+    $script:WorkerStatusPrefix = if ($trackingOnly) { '未收到任务确认，正在等待任务结束：' } else { '' }
+
+    Set-WorkerBusy $true
+    # 启动时的恢复不清空日志：其中可能有启动检查写入的安全警告。
+    if ($Action -ne 'Restore') { $logTextBox.Clear() }
+    if ($trackingOnly) {
+        $notice = '未收到提权 Worker 的任务确认：{0}任务可能已经在运行，界面会在它结束后解锁。' -f $LostReplyReason
+        $statusLabel.Text = $notice
+        $logTextBox.AppendText($notice + [Environment]::NewLine)
+    } else {
+        $statusLabel.Text = switch ($Action) {
+            'Analyze' { '正在后台扫描来源并检查目标…' }
+            'Migrate' { '迁移进行中…' }
+            'Cleanup' { '正在清理失败副本…' }
+            default { '正在恢复中断的迁移…' }
+        }
+    }
+    $progressBar.Style = 'Marquee'
+    $progressBar.MarqueeAnimationSpeed = 25
+    $script:WorkerTimer.Start()
 }
 
 function Start-Worker([string]$Action, [object[]]$Items, $Config) {
@@ -755,15 +793,13 @@ function Start-Worker([string]$Action, [object[]]$Items, $Config) {
     $sessionName = 'mklinktool-' + [guid]::NewGuid().ToString('N')
     $sessionPath = Join-Path ([System.IO.Path]::GetTempPath()) $sessionName
     $journalPath = ''
+    $requestId = [guid]::NewGuid().ToString('N')
     $requestSent = $false
     $requestRejected = $false
     try {
         [void][System.IO.Directory]::CreateDirectory($sessionPath)
-        $configPath = Join-Path $sessionPath 'job.json'
-        $statePath = Join-Path $sessionPath 'state.json'
-        $logPath = Join-Path $sessionPath 'engine.log'
         $configJson = ($Config | ConvertTo-Json -Depth 5)
-        [System.IO.File]::WriteAllText($configPath, $configJson, [System.Text.UTF8Encoding]::new($false))
+        [System.IO.File]::WriteAllText((Join-Path $sessionPath 'job.json'), $configJson, [System.Text.UTF8Encoding]::new($false))
 
         Connect-ElevatedWorker
         if ($Action -eq 'Migrate') {
@@ -771,8 +807,6 @@ function Start-Worker([string]$Action, [object[]]$Items, $Config) {
             # 下次启动据此检测并提示恢复。
             $journalPath = Write-RecoveryJournal $sessionName $Items
         }
-        $requestId = [guid]::NewGuid().ToString('N')
-        $resultPath = Join-Path $sessionPath ('result-{0}.json' -f $requestId)
         $request = @{
             Type = 'Execute'
             RequestId = $requestId
@@ -782,9 +816,10 @@ function Start-Worker([string]$Action, [object[]]$Items, $Config) {
             # 显式传入主窗口的临时根目录供 Worker 校验会话位置。
             SessionTempRoot = [System.IO.Path]::GetFullPath([System.IO.Path]::GetTempPath())
         }
+        # 从开始写出请求起就按“可能已送达”处理：写入中途出错时，Worker 也可能已经读到完整的一行。
+        $requestSent = $true
         $script:WorkerWriter.WriteLine((ConvertTo-WorkerMessageJson $request))
         $script:WorkerWriter.Flush()
-        $requestSent = $true
         $reply = Read-WorkerMessage
         if ([string]$reply.Type -eq 'Error') {
             $requestRejected = $true
@@ -793,37 +828,19 @@ function Start-Worker([string]$Action, [object[]]$Items, $Config) {
         if ([string]$reply.Type -ne 'Accepted' -or [string]$reply.RequestId -ne $requestId -or [string]$reply.Action -ne $Action) {
             throw '提权 Worker 返回了不匹配的任务确认。'
         }
-
-        $script:WorkerAction = $Action
-        $script:WorkerItems = $Items
-        $script:WorkerJournalPath = $journalPath
-        $script:WorkerRequestId = $requestId
-        $script:WorkerResultPath = $resultPath
-        $script:WorkerEnginePid = [int]$reply.EnginePid
-        $script:WorkerEngineStartTime = [string]$reply.EngineStartTime
-        $script:WorkerState = $null
-        $script:WorkerStatePath = $statePath
-        $script:WorkerLogPath = $logPath
-        $script:WorkerSessionPath = $sessionPath
-        $script:LogBytesShown = 0
-        $script:ActiveJob = $true
-
-        Set-WorkerBusy $true
-        $statusLabel.Text = switch ($Action) {
-            'Analyze' { '正在后台扫描来源并检查目标…' }
-            'Migrate' { '迁移进行中…' }
-            'Cleanup' { '正在清理失败副本…' }
-            default { '正在恢复中断的迁移…' }
-        }
-        $progressBar.Style = 'Marquee'
-        $progressBar.MarqueeAnimationSpeed = 25
-        $script:WorkerTimer.Start()
+        Enter-WorkerTask $Action $Items $journalPath $requestId $sessionPath ([int]$reply.EnginePid) ([string]$reply.EngineStartTime) ''
     } catch {
-        if (-not $requestSent -or $requestRejected) {
-            # 任务未被 Worker 接受：不可能已在处理本会话，可安全清理会话目录与中断恢复记录。
-            try { [System.IO.Directory]::Delete($sessionPath, $true) } catch { }
-            Remove-RecoveryJournal $journalPath
+        if ($requestSent -and -not $requestRejected) {
+            # 请求可能已被 Worker 接手，只是确认超时、丢失或无法解析。此时解锁界面会让人以为没有任务在运行，
+            # 进而重复操作或关闭窗口；改为断开连接并跟踪结果文件。Worker 做完手头的任务、读到管道关闭就会退出，
+            # 所以跟踪一定会结束。会话目录与中断恢复记录都要保留。
+            Close-WorkerConnection
+            Enter-WorkerTask $Action $Items $journalPath $requestId $sessionPath 0 '' $_.Exception.Message
+            return
         }
+        # 任务没有交给 Worker（尚未发出或被明确拒绝）：不可能已在处理本会话，可安全清理会话目录与中断恢复记录。
+        try { [System.IO.Directory]::Delete($sessionPath, $true) } catch { }
+        Remove-RecoveryJournal $journalPath
         throw
     }
 }
@@ -865,15 +882,48 @@ function Update-WorkerItem($Item, $Result) {
         $Item.SymbolicLinkCount = [int]$Result.SymbolicLinkCount
         $Item.AbsoluteLinkCount = [int]$Result.AbsoluteLinkCount
     }
-    if ($script:WorkerAction -eq 'Migrate' -and $Item.Status -in @('Failed', 'RolledBack')) {
-        # 改名前失败或已回滚：来源仍完好，遗留的目标副本可用“清理失败副本”删除。
-        $Item.CleanupTarget = [string]$Result.Target
+    if ($script:WorkerAction -eq 'Migrate') {
+        if ($Item.Status -in @('Failed', 'RolledBack')) {
+            # 改名前失败或已回滚：来源仍完好，遗留的目标副本可用“清理失败副本”删除。
+            $Item.CleanupTarget = [string]$Result.Target
+        } elseif ($Item.Status -in @('Complete', 'CompleteBackupRetained')) {
+            # 迁移已成功：先前记下的失败副本要么已被手动处理（甚至就是现在的目标），要么因来源已是链接而不能再自动清理。
+            $Item.CleanupTarget = ''
+        }
     } elseif ($script:WorkerAction -eq 'Cleanup' -and $Item.Status -eq 'Cleaned') {
         $Item.CleanupTarget = ''
     }
 }
 
-function Update-WorkerView {
+function Read-WorkerStateFile {
+    # 以 ReadWrite|Delete 共享读取 state.json（引擎随时会原子替换它）；不存在或读取失败时返回 $null。
+    if ([string]::IsNullOrWhiteSpace($script:WorkerStatePath) -or -not [System.IO.File]::Exists($script:WorkerStatePath)) { return $null }
+    $stateStream = $null
+    $stateReader = $null
+    try {
+        $stateShare = [System.IO.FileShare]::ReadWrite -bor [System.IO.FileShare]::Delete
+        $stateStream = [System.IO.FileStream]::new($script:WorkerStatePath, [System.IO.FileMode]::Open, [System.IO.FileAccess]::Read, $stateShare)
+        $stateReader = [System.IO.StreamReader]::new($stateStream, [System.Text.Encoding]::UTF8)
+        $state = $stateReader.ReadToEnd() | ConvertFrom-Json
+        if ($script:WorkerEnginePid -le 0 -and $null -ne $state.PSObject.Properties['EnginePid']) {
+            # 没收到 Worker 的任务确认时，改用引擎自己写入的进程标识判断它是否仍在运行。
+            $script:WorkerEnginePid = [int]$state.EnginePid
+            $script:WorkerEngineStartTime = [string]$state.EngineStartTime
+        }
+        return $state
+    } catch {
+        return $null
+    } finally {
+        if ($null -ne $stateReader) {
+            $stateReader.Dispose()
+        } elseif ($null -ne $stateStream) {
+            $stateStream.Dispose()
+        }
+    }
+}
+
+function Read-WorkerProgress {
+    # 把引擎日志的新增部分与 state.json 中的进度写回界面；读取失败（文件正被替换等）留到下一次轮询。
     if (-not [string]::IsNullOrWhiteSpace($script:WorkerLogPath) -and [System.IO.File]::Exists($script:WorkerLogPath)) {
         try {
             $delta = Read-WorkerLogDelta
@@ -885,70 +935,81 @@ function Update-WorkerView {
         } catch { }
     }
 
-    if (-not [string]::IsNullOrWhiteSpace($script:WorkerStatePath) -and [System.IO.File]::Exists($script:WorkerStatePath)) {
-        try {
-            $stateStream = $null
-            $stateReader = $null
-            try {
-                $stateShare = [System.IO.FileShare]::ReadWrite -bor [System.IO.FileShare]::Delete
-                $stateStream = [System.IO.FileStream]::new($script:WorkerStatePath, [System.IO.FileMode]::Open, [System.IO.FileAccess]::Read, $stateShare)
-                $stateReader = [System.IO.StreamReader]::new($stateStream, [System.Text.Encoding]::UTF8)
-                $state = $stateReader.ReadToEnd() | ConvertFrom-Json
-            } finally {
-                if ($null -ne $stateReader) {
-                    $stateReader.Dispose()
-                } elseif ($null -ne $stateStream) {
-                    $stateStream.Dispose()
-                }
+    $state = Read-WorkerStateFile
+    if ($null -eq $state) { return }
+    $script:WorkerState = $state
+    try {
+        foreach ($resultJob in @($state.Jobs)) {
+            # 引擎按 job.json 的顺序回写序号：按序号匹配，不依赖两侧路径规范化（8.3、..、末尾点等）一致。
+            if ($null -eq $resultJob.Index) { continue }
+            $itemIndex = [int]$resultJob.Index
+            if ($itemIndex -ge 0 -and $itemIndex -lt $script:WorkerItems.Count) {
+                Update-WorkerItem $script:WorkerItems[$itemIndex] $resultJob
             }
-            $script:WorkerState = $state
-            foreach ($resultJob in @($state.Jobs)) {
-                # 引擎按 job.json 的顺序回写序号：按序号匹配，不依赖两侧路径规范化（8.3、..、末尾点等）一致。
-                if ($null -eq $resultJob.Index) { continue }
-                $itemIndex = [int]$resultJob.Index
-                if ($itemIndex -ge 0 -and $itemIndex -lt $script:WorkerItems.Count) {
-                    Update-WorkerItem $script:WorkerItems[$itemIndex] $resultJob
-                }
-            }
-            Refresh-Grid
-            if ($state.Phase) { $statusLabel.Text = Convert-StatusText ([string]$state.Phase) }
-        } catch { }
+        }
+        Refresh-Grid
+        if ($state.Phase) { $statusLabel.Text = $script:WorkerStatusPrefix + (Convert-StatusText ([string]$state.Phase)) }
+    } catch { }
+}
+
+function Test-EngineRunning {
+    # Get-Process 只列出仍在运行的进程；再核对进程名与启动时间，避免 PID 被复用后误判。
+    # 不读取 HasExited：非提权的主窗口打开提权引擎时，它需要的 PROCESS_QUERY_INFORMATION 会被完整性级别拒绝，
+    # 而 PowerShell 会把属性 getter 的异常静默变成 $null。WaitForExit(0) 只需 SYNCHRONIZE，且是方法调用，失败会正常抛出。
+    # 判断不了时一律按“仍在运行”处理：宁可多锁定，也不在引擎还在改动目录时解锁。
+    if ($script:WorkerEnginePid -le 0) { return $false }
+    try {
+        $engineProcess = Get-Process -Id $script:WorkerEnginePid -ErrorAction Stop
+    } catch {
+        return $false
     }
+    try {
+        if ($engineProcess.WaitForExit(0)) { return $false }
+    } catch { }
+    if ($engineProcess.ProcessName -ne 'powershell') { return $false }
+    if ([string]::IsNullOrEmpty($script:WorkerEngineStartTime)) { return $true }
+    try {
+        return ([string]$engineProcess.StartTime.ToFileTime()) -eq $script:WorkerEngineStartTime
+    } catch {
+        return $true
+    }
+}
 
-    if (-not $script:ActiveJob) { return }
-
+function Get-WorkerCompletion {
+    # 判断当前任务是否已结束：仍在进行返回 $null；否则返回 ExitCode（未知为 $null）与需要提示的说明。
     if ([System.IO.File]::Exists($script:WorkerResultPath)) {
         try {
             $result = [System.IO.File]::ReadAllText($script:WorkerResultPath, [System.Text.Encoding]::UTF8) | ConvertFrom-Json -ErrorAction Stop
             if ([int]$result.Version -eq 1 -and [string]$result.RequestId -eq $script:WorkerRequestId -and [string]$result.Action -eq $script:WorkerAction) {
-                Complete-WorkerAction ([int]$result.ExitCode)
-                return
+                # [int]$null 为 0，不能把缺失的退出码当成成功。
+                if ($null -eq $result.ExitCode) {
+                    return [pscustomobject]@{ ExitCode = $null; Message = '提权 Worker 没有取得引擎的退出码，任务结果未知；请核对日志与当前状态。' }
+                }
+                return [pscustomobject]@{ ExitCode = [int]$result.ExitCode; Message = '' }
             }
         } catch { }
     }
-
     if ($null -ne $script:Worker) {
         $script:Worker.Refresh()
-        if ($script:Worker.HasExited) {
-            $engineStillRunning = $false
-            if ($script:WorkerEnginePid -gt 0) {
-                try {
-                    $engineProcess = Get-Process -Id $script:WorkerEnginePid -ErrorAction Stop
-                    if (-not $engineProcess.HasExited) {
-                        # 同时校验进程名与启动时间，避免 PID 被复用后误判引擎仍在运行。
-                        $engineStillRunning = ($engineProcess.ProcessName -eq 'powershell')
-                        if ($engineStillRunning -and -not [string]::IsNullOrEmpty($script:WorkerEngineStartTime)) {
-                            $engineStillRunning = ([string]$engineProcess.StartTime.ToFileTime()) -eq $script:WorkerEngineStartTime
-                        }
-                    }
-                } catch { }
-            }
-            if (-not $engineStillRunning) {
-                $fallbackExitCode = if ($null -ne $script:WorkerState -and [bool]$script:WorkerState.Success) { 0 } else { 1 }
-                Complete-WorkerAction $fallbackExitCode '提权 Worker 意外退出；引擎进程已结束，请核对日志与当前状态。'
-            }
-        }
+        if (-not $script:Worker.HasExited) { return $null }
     }
+    # Worker 已退出却没有结果：引擎不随 Worker 退出，确认它也已结束才算结束。
+    if ($script:WorkerEnginePid -le 0) { [void](Read-WorkerStateFile) }
+    if (Test-EngineRunning) { return $null }
+    return [pscustomobject]@{ ExitCode = $null; Message = '提权 Worker 已退出且没有返回本次任务的结果；引擎进程已结束，请核对日志与当前状态。' }
+}
+
+function Update-WorkerView {
+    # 必须先判定是否结束、再读取进度：Worker 在引擎退出之后才写结果文件、才会退出，所以先确认“已结束”，
+    # 随后读到的就一定是最终状态与完整日志。顺序反过来，引擎的最后一次写入可能恰好落在两步之间而被永久漏掉。
+    $completion = if ($script:ActiveJob) { Get-WorkerCompletion } else { $null }
+    Read-WorkerProgress
+    if ($null -eq $completion) { return }
+    $exitCode = $completion.ExitCode
+    if ($null -eq $exitCode) {
+        $exitCode = if ($null -ne $script:WorkerState -and [bool]$script:WorkerState.Success) { 0 } else { 1 }
+    }
+    Complete-WorkerAction $exitCode $completion.Message
 }
 $script:WorkerTimer = New-Object System.Windows.Forms.Timer
 $script:WorkerTimer.Interval = 500
@@ -1310,7 +1371,6 @@ $analyzeButton.Add_Click({
         $job.AbsoluteLinkCount = 0
     }
     Refresh-Grid
-    $logTextBox.Clear()
 })
 
 $startButton.Add_Click({
@@ -1343,7 +1403,6 @@ $startButton.Add_Click({
     if ($answer -ne [System.Windows.Forms.DialogResult]::Yes) { return }
     try {
         Start-Worker 'Migrate' @($script:Jobs) (Get-WorkerConfig)
-        $logTextBox.Clear()
     } catch {
         $statusLabel.Text = '无法启动提权 Worker 或迁移任务。'
         [System.Windows.Forms.MessageBox]::Show($_.Exception.Message, 'mklinktool', 'OK', 'Error') | Out-Null
@@ -1361,7 +1420,6 @@ $cleanupButton.Add_Click({
     $config = [pscustomobject]@{ Jobs = @($candidates | ForEach-Object { [pscustomobject]@{ Source = $_.Source; Target = $_.CleanupTarget } }) }
     try {
         Start-Worker 'Cleanup' $candidates $config
-        $logTextBox.Clear()
     } catch {
         $statusLabel.Text = '无法启动提权 Worker 或清理任务。'
         [System.Windows.Forms.MessageBox]::Show($_.Exception.Message, 'mklinktool', 'OK', 'Error') | Out-Null

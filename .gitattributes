@@ -1,0 +1,4 @@
+* text=auto
+# Windows 脚本检出时固定为 CRLF（仓库内统一存 LF），不受各人 core.autocrlf 设置与 GitHub ZIP 下载方式影响。
+*.cmd text eol=crlf
+*.ps1 text eol=crlf

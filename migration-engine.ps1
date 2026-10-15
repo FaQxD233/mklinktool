@@ -42,6 +42,9 @@ $script:State = [ordered]@{
     Phase = 'Starting'
     Success = $false
     LogIncomplete = $false
+    # 主窗口没收到 Worker 的任务确认（其中带有引擎 PID）时，凭这两项判断引擎是否仍在运行。
+    EnginePid = $PID
+    EngineStartTime = [string]([System.Diagnostics.Process]::GetCurrentProcess().StartTime.ToFileTime())
     Jobs = @()
     Errors = @()
     Warnings = @()
@@ -264,7 +267,7 @@ function Test-SymbolicLinkCreation {
     }
 }
 
-function Get-ContainedDirectoryLinkInfo($Entry, [string]$RootPath, [string]$AbsoluteLinkRoot) {
+function Get-ContainedDirectoryLinkInfo($Entry, [string]$RootPath, [string]$AbsoluteLinkRoot, [bool]$RequireTargetExists = $true) {
     $Path = ConvertFrom-ExtendedLengthPath $Entry.FullName
     $attributes = $Entry.Attributes
     if (($attributes -band [System.IO.FileAttributes]::Directory) -eq 0) {
@@ -306,7 +309,7 @@ function Get-ContainedDirectoryLinkInfo($Entry, [string]$RootPath, [string]$Abso
     if (-not (Test-PathContains $targetBoundary $resolvedTarget)) {
         throw "链接目标位于来源目录之外，拒绝迁移：$Path -> $linkTarget"
     }
-    if (-not [System.IO.Directory]::Exists((Get-ExtendedLengthPath $resolvedTarget))) {
+    if ($RequireTargetExists -and -not [System.IO.Directory]::Exists((Get-ExtendedLengthPath $resolvedTarget))) {
         throw "链接目标不存在或不可访问：$Path -> $linkTarget"
     }
 
@@ -333,7 +336,7 @@ function Get-Sha256Hex([string]$Path) {
     return [System.BitConverter]::ToString($hashBytes).Replace('-', '')
 }
 
-function Get-TreeSnapshot([string]$Path, [bool]$IncludeHash, [string]$AbsoluteLinkRoot) {
+function Get-TreeSnapshot([string]$Path, [bool]$IncludeHash, [string]$AbsoluteLinkRoot, [bool]$RequireLinkTargets = $true) {
     $rootPath = ConvertTo-FullPath $Path
     if ([string]::IsNullOrWhiteSpace($AbsoluteLinkRoot)) { $AbsoluteLinkRoot = $rootPath }
     $extendedRootPath = Get-ExtendedLengthPath $rootPath
@@ -357,7 +360,7 @@ function Get-TreeSnapshot([string]$Path, [bool]$IncludeHash, [string]$AbsoluteLi
         foreach ($entry in $directory.GetFileSystemInfos()) {
             $relativePath = (ConvertFrom-ExtendedLengthPath $entry.FullName).Substring($rootPrefix.Length).TrimStart('\')
             if (($entry.Attributes -band [System.IO.FileAttributes]::ReparsePoint) -ne 0) {
-                $links[$relativePath] = Get-ContainedDirectoryLinkInfo -Entry $entry -RootPath $rootPath -AbsoluteLinkRoot $AbsoluteLinkRoot
+                $links[$relativePath] = Get-ContainedDirectoryLinkInfo -Entry $entry -RootPath $rootPath -AbsoluteLinkRoot $AbsoluteLinkRoot -RequireTargetExists $RequireLinkTargets
                 continue
             }
             if (($entry.Attributes -band [System.IO.FileAttributes]::Directory) -ne 0) {
@@ -365,8 +368,10 @@ function Get-TreeSnapshot([string]$Path, [bool]$IncludeHash, [string]$AbsoluteLi
                 continue
             }
 
+            # 单独读取一次元数据，不用枚举结果自带的值：NTFS 目录项里缓存的大小与时间在文件仍被写入时会滞后，
+            # 而快照比较要发现的恰恰是这类写入。
             $fileInfo = [System.IO.FileInfo]::new($entry.FullName)
-            $item = [ordered]@{ Length = [long]$fileInfo.Length }
+            $item = [ordered]@{ Length = [long]$fileInfo.Length; LastWriteTicks = $fileInfo.LastWriteTimeUtc.Ticks }
             if ($IncludeHash) {
                 $item.Hash = Get-Sha256Hex $fileInfo.FullName
             }
@@ -656,7 +661,8 @@ function Get-MigrationAnalysis($Config) {
     }
 }
 
-function Compare-TreeSnapshots($SourceSnapshot, $TargetSnapshot, [bool]$IncludeHash) {
+function Compare-TreeSnapshots($SourceSnapshot, $TargetSnapshot, [bool]$IncludeHash, [long]$TimeToleranceTicks = -1) {
+    # $TimeToleranceTicks 为负数时不比较修改时间，0 表示必须完全一致。
     if ($SourceSnapshot.FileCount -ne $TargetSnapshot.FileCount) {
         return "文件数不一致：源 $($SourceSnapshot.FileCount)，目标 $($TargetSnapshot.FileCount)"
     }
@@ -674,6 +680,9 @@ function Compare-TreeSnapshots($SourceSnapshot, $TargetSnapshot, [bool]$IncludeH
         $targetFile = $TargetSnapshot.Files[$relativePath]
         if ($sourceFile.Length -ne $targetFile.Length) {
             return "文件大小不一致：$relativePath"
+        }
+        if ($TimeToleranceTicks -ge 0 -and [Math]::Abs([long]$sourceFile.LastWriteTicks - [long]$targetFile.LastWriteTicks) -gt $TimeToleranceTicks) {
+            return "文件修改时间不一致：$relativePath"
         }
         if ($IncludeHash -and $sourceFile.Hash -ne $targetFile.Hash) {
             return "SHA-256 不一致：$relativePath"
@@ -694,6 +703,24 @@ function Compare-TreeSnapshots($SourceSnapshot, $TargetSnapshot, [bool]$IncludeH
         }
     }
     return ''
+}
+
+function Get-TimestampToleranceTicks([string]$TargetPath) {
+    # 目标卷保存修改时间的精度：NTFS/ReFS 与来源完全一致；exFAT 为 10 ms；FAT32 以本地时间保存，
+    # 跨夏令时会差整小时，因此不比较（返回 -1）。
+    switch ([string](Get-DriveInfoForPath $TargetPath).DriveFormat) {
+        'NTFS' { return 0L }
+        'ReFS' { return 0L }
+        'exFAT' { return [TimeSpan]::FromSeconds(2).Ticks }
+    }
+    return -1L
+}
+
+function Get-SourceChangeSince($SourceSnapshot, [string]$CurrentPath, [string]$OriginalSource) {
+    # 按元数据（相对路径、文件大小与修改时间、嵌套链接）比较 $CurrentPath 与早先的来源快照，返回差异描述，无差异返回空串。
+    # 用于改名后的备份：同一卷上时间戳必须完全一致；备份中的绝对链接仍指向原来源路径，不要求链接目标存在。
+    $currentSnapshot = Get-TreeSnapshot -Path $CurrentPath -IncludeHash:$false -AbsoluteLinkRoot:$OriginalSource -RequireLinkTargets:$false
+    return Compare-TreeSnapshots -SourceSnapshot $SourceSnapshot -TargetSnapshot $currentSnapshot -IncludeHash:$false -TimeToleranceTicks 0
 }
 
 function Test-CreatedLink([string]$Path, [string]$Target, [string]$LinkType) {
@@ -812,10 +839,15 @@ function Invoke-Migration($Config) {
             $analysis.Status = 'Verifying'
             $script:State.Phase = 'Verifying'
             Write-State
-            Write-Log '比较相对路径、文件数和总字节数。'
+            $timeToleranceTicks = Get-TimestampToleranceTicks $target
+            if ($timeToleranceTicks -lt 0) {
+                Write-Log '比较相对路径、文件数和文件大小（目标卷不能精确保存修改时间，不比较修改时间）。'
+            } else {
+                Write-Log '比较相对路径、文件数、文件大小和修改时间。'
+            }
             $sourceSnapshot = Get-TreeSnapshot -Path $source -IncludeHash:([bool]$Config.VerifySha256)
             $targetSnapshot = Get-TreeSnapshot -Path $target -IncludeHash:([bool]$Config.VerifySha256) -AbsoluteLinkRoot:$source
-            $difference = Compare-TreeSnapshots -SourceSnapshot $sourceSnapshot -TargetSnapshot $targetSnapshot -IncludeHash:([bool]$Config.VerifySha256)
+            $difference = Compare-TreeSnapshots -SourceSnapshot $sourceSnapshot -TargetSnapshot $targetSnapshot -IncludeHash:([bool]$Config.VerifySha256) -TimeToleranceTicks $timeToleranceTicks
             if (-not [string]::IsNullOrEmpty($difference)) {
                 throw "复制校验失败：$difference；源目录保留在原处，目标副本保留。"
             }
@@ -845,9 +877,15 @@ function Invoke-Migration($Config) {
             $linkCreated = $true
             Test-CreatedLink -Path $source -Target $target -LinkType ([string]$Config.LinkType)
             Test-NestedLinksAccessible -SourceRoot $source -TargetRoot $target -Snapshot $sourceSnapshot
-            # 提交点：链接已建立并通过验证。此后任何异常都只能记录，不得回滚（见下方 catch）。
+            # 快照之后、改名之前写入来源的内容不在目标副本中，删除备份就会丢失：提交前用改名后的备份复核一次，
+            # 有变化就按建链失败处理（删除本次创建的链接、改回原名）。放在建链之后做，原路径缺失的时间不会因复核而延长。
+            $sourceChange = Get-SourceChangeSince -SourceSnapshot $sourceSnapshot -CurrentPath $backup -OriginalSource $source
+            if (-not [string]::IsNullOrEmpty($sourceChange)) {
+                throw "来源在复制校验之后仍被写入（$sourceChange），这些改动不在目标副本中。请关闭使用该目录的应用后重试。"
+            }
+            # 提交点：链接已建立并通过验证，备份也与复制校验时的来源一致。此后任何异常都只能记录，不得回滚（见下方 catch）。
             $jobSucceeded = $true
-            Write-Log '顶层 SymbolicLink 与嵌套链接的类型、目标及目录访问验证通过。'
+            Write-Log '顶层 SymbolicLink 与嵌套链接的类型、目标及目录访问验证通过；改名后的备份与复制校验时的来源一致。'
 
             if ([bool]$Config.DeleteBackup) {
                 $backupModified = $false
