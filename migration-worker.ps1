@@ -135,7 +135,7 @@ try {
             $requestId = [string]$request.RequestId
             if ($requestId -notmatch '^[a-fA-F0-9]{32}$') { throw 'Invalid request identifier.' }
             $action = [string]$request.Action
-            if ($action -notin @('Analyze', 'Migrate')) { throw 'Unsupported engine action.' }
+            if ($action -notin @('Analyze', 'Migrate', 'Cleanup', 'Restore')) { throw 'Unsupported engine action.' }
 
             $sessionPath = Resolve-SessionPath ([string]$request.SessionPath) ([string]$request.SessionTempRoot)
             $configPath = Join-Path $sessionPath 'job.json'

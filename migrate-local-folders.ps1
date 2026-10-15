@@ -28,10 +28,18 @@ $script:WorkerState = $null
 $script:WorkerStatePath = ''
 $script:WorkerLogPath = ''
 $script:WorkerSessionPath = ''
-$script:LogCharactersShown = 0
+$script:WorkerItems = @()
+$script:WorkerJournalPath = ''
+$script:LogBytesShown = 0
 $script:PlanValid = $false
 $script:LastAnalysisSignature = ''
 $script:ContextPath = ''
+# 每次迁移开始前写入一份中断恢复记录，启动时据此检测“备份存在而原路径缺失”。
+$script:RecoveryJournalRoot = Join-Path ([Environment]::GetFolderPath('LocalApplicationData')) 'mklinktool\pending'
+# Everyone / Authenticated Users / Users / INTERACTIVE：本机任意账户都属于的宽泛组。
+$script:BroadPrincipalSids = @('S-1-1-0', 'S-1-5-11', 'S-1-5-32-545', 'S-1-5-4')
+# 能修改内容、删除或改写权限的访问位，另含 GENERIC_WRITE(0x40000000) 与 GENERIC_ALL(0x10000000)。
+$script:WriteRightsMask = [int][System.Security.AccessControl.FileSystemRights]'WriteData, AppendData, DeleteSubdirectoriesAndFiles, Delete, ChangePermissions, TakeOwnership' -bor 0x50000000
 
 Add-Type -TypeDefinition 'using System; using System.Runtime.InteropServices; public static class MklinkToolPipeNative { [DllImport("kernel32.dll", SetLastError = true)] public static extern bool GetNamedPipeClientProcessId(IntPtr pipe, out uint clientProcessId); }'
 
@@ -47,11 +55,15 @@ function Format-Bytes([long]$Bytes) {
 }
 
 function Convert-StatusText([string]$Code) {
+    # 作业的 Status 一律保存状态码（引擎状态码或下面的界面状态码），只在显示时转换为中文。
     $labels = @{
+        NotChecked = '待预检'; Queued = '等待扫描'; Stale = '待重新预检'; NotStarted = '未执行'; Waiting = '等待中'
         Starting = '启动中'; Analyzing = '扫描中'; Ready = '预检通过'; Checking = '检查中'; Scanning = '扫描中'
         Error = '错误'; PreflightFailed = '预检未通过'; Copying = '复制中'; Verifying = '校验中'
         RenamingSource = '备份改名中'; CreatingLink = '创建链接中'; Complete = '完成'
         CompleteBackupRetained = '完成，保留备份'; RolledBack = '已回滚'; RecoveryRequired = '需要人工恢复'; Failed = '失败'
+        Cleaning = '清理中'; Cleaned = '副本已清理'; CleanupFailed = '清理失败'
+        Restoring = '恢复中'; Restored = '已恢复'; RestoreSkipped = '无需恢复'; RestoreFailed = '恢复失败'
     }
     if ($labels.ContainsKey($Code)) { return $labels[$Code] }
     return $Code
@@ -61,10 +73,21 @@ function ConvertTo-UiFullPath([string]$Path) {
     try { return [System.IO.Path]::GetFullPath($Path) } catch { return $Path }
 }
 
-function Get-PathCompareKey([string]$Path) {
-    # 引擎写入 state.json 前会规范化路径（去末尾反斜杠、统一斜杠方向）；
-    # UI 与引擎的任务匹配必须使用同一形态，否则用户输入末尾反斜杠时永远匹配不上。
-    return ([string]$Path).Replace('/', '\').TrimEnd('\')
+function ConvertTo-UiDevicePath([string]$Path) {
+    # \\?\ 设备路径不受 .NET Framework 260 字符限制（系统未启用 LongPathsEnabled 时）；UNC 需写成 \\?\UNC\。
+    if ($Path.StartsWith('\\?\', [System.StringComparison]::Ordinal)) { return $Path }
+    if ($Path.StartsWith('\\', [System.StringComparison]::Ordinal)) { return '\\?\UNC\' + $Path.Substring(2) }
+    return '\\?\' + $Path
+}
+
+function Join-UiPath([string]$BasePath, [string]$ChildPath) {
+    # 纯字符串拼接：Join-Path 会解析 PowerShell 驱动器，根目录填了不存在的盘符时直接抛 DriveNotFoundException。
+    return $BasePath.TrimEnd('\', '/') + '\' + $ChildPath
+}
+
+function Get-StructureMode {
+    if ($structureCombo.SelectedIndex -eq 1) { return 'Categorized' }
+    return 'Flat'
 }
 
 function Get-GeneratedTarget([string]$Source, [string]$Root, [string]$Mode) {
@@ -86,19 +109,19 @@ function Get-GeneratedTarget([string]$Source, [string]$Root, [string]$Mode) {
             $category = $parent.Name.ToLowerInvariant()
         }
         $datedCategory = '{0}-{1}{2}' -f $category, $name, (Get-Date -Format 'yyMMdd')
-        return Join-Path (Join-Path $Root $datedCategory) $name
+        return Join-UiPath (Join-UiPath $Root $datedCategory) $name
     }
-    return Join-Path $Root $name
+    return Join-UiPath $Root $name
 }
 function Get-CurrentSignature {
+    # 只纳入影响预检结论的内容。Analyze 不使用 SHA-256 与备份清理选项，Migrate 会读取当时的勾选值并重新预检，
+    # 因此切换这两项不必作废预检结果。
     $currentJobs = @()
     foreach ($job in $script:Jobs) {
         $currentJobs += [pscustomobject]@{ Source = $job.Source; Target = $job.Target }
     }
     $signatureObject = [pscustomobject]@{
         LinkType = 'SymbolicLink'
-        VerifySha256 = [bool]$shaCheckbox.Checked
-        DeleteBackup = [bool]$deleteBackupCheckbox.Checked
         Jobs = $currentJobs
     }
     return ($signatureObject | ConvertTo-Json -Depth 4 -Compress)
@@ -109,27 +132,24 @@ function Refresh-Grid {
     # 避免每 500ms 全量 Rows.Clear() 造成闪烁、滚动位置与选中状态丢失。
     if ($grid.Rows.Count -ne $script:Jobs.Count) {
         $grid.Rows.Clear()
-        foreach ($job in $script:Jobs) {
-            $rowIndex = $grid.Rows.Add($job.Source, $job.Target, [string]$job.FileCount, (Format-Bytes ([long]$job.TotalBytes)), [string]$job.JunctionCount, [string]$job.SymbolicLinkCount, $job.Status)
-            $grid.Rows[$rowIndex].Tag = $job
-        }
+        foreach ($job in $script:Jobs) { [void]$grid.Rows.Add() }
     }
     for ($i = 0; $i -lt $script:Jobs.Count; $i++) {
         $job = $script:Jobs[$i]
         $row = $grid.Rows[$i]
         $row.Tag = $job
-        $cellValues = @(
-            @('Source', [string]$job.Source),
-            @('Target', [string]$job.Target),
-            @('FileCount', [string]$job.FileCount),
-            @('Size', (Format-Bytes ([long]$job.TotalBytes))),
-            @('JunctionCount', [string]$job.JunctionCount),
-            @('SymbolicLinkCount', [string]$job.SymbolicLinkCount),
-            @('Status', [string]$job.Status)
-        )
-        foreach ($entry in $cellValues) {
-            $cell = $row.Cells[[string]$entry[0]]
-            $newValue = [string]$entry[1]
+        $cellValues = [ordered]@{
+            Source = [string]$job.Source
+            Target = [string]$job.Target
+            FileCount = [string]$job.FileCount
+            Size = Format-Bytes ([long]$job.TotalBytes)
+            JunctionCount = [string]$job.JunctionCount
+            SymbolicLinkCount = [string]$job.SymbolicLinkCount
+            Status = Convert-StatusText ([string]$job.Status)
+        }
+        foreach ($columnName in $cellValues.Keys) {
+            $cell = $row.Cells[$columnName]
+            $newValue = [string]$cellValues[$columnName]
             if (-not [string]::Equals([string]$cell.Value, $newValue, [System.StringComparison]::Ordinal)) {
                 $cell.Value = $newValue
             }
@@ -138,8 +158,9 @@ function Refresh-Grid {
         # 行头不可见，错误图标必须挂在 Status 单元格上才能被用户看到。
         $statusCell = $row.Cells['Status']
         $statusCell.ErrorText = [string]$job.Error
-        $statusCell.ToolTipText = [string]$job.Warning
+        $statusCell.ToolTipText = @(@([string]$job.Warning, [string]$job.PermissionWarning) | Where-Object { -not [string]::IsNullOrWhiteSpace($_) }) -join [Environment]::NewLine
     }
+    Update-CleanupButton
 }
 
 function Test-WorkerActive {
@@ -153,7 +174,7 @@ function Add-SourcePaths([string[]]$Paths) {
     }
 
     if ($grid.IsCurrentCellInEditMode) { [void]$grid.EndEdit() }
-    $mode = if ($structureCombo.SelectedIndex -eq 1) { 'Categorized' } else { 'Flat' }
+    $mode = Get-StructureMode
     $addedCount = 0
     $duplicateCount = 0
     $invalidPaths = New-Object System.Collections.ArrayList
@@ -172,6 +193,8 @@ function Add-SourcePaths([string[]]$Paths) {
             [void]$unsupportedPaths.Add($rawPath)
             continue
         }
+        # GetFullPath 会保留末尾反斜杠；统一去掉，使 C:\a 与 C:\a\ 去重时视为同一目录。
+        $source = $source.TrimEnd('\')
         if (-not [System.IO.Directory]::Exists($source)) {
             [void]$invalidPaths.Add([string]$pathValue)
             continue
@@ -198,9 +221,12 @@ function Add-SourcePaths([string[]]$Paths) {
             JunctionCount = 0
             SymbolicLinkCount = 0
             AbsoluteLinkCount = 0
-            Status = '待预检'
+            Status = 'NotChecked'
             Warning = ''
+            PermissionWarning = ''
             Error = ''
+            # 迁移在改名前失败或已回滚后遗留的目标副本路径，供“清理失败副本”使用。
+            CleanupTarget = ''
         }
         [void]$script:Jobs.Add($job)
         $addedCount++
@@ -249,9 +275,19 @@ function Set-PlanStale([string]$Message) {
     $startButton.Enabled = $false
     if (-not [string]::IsNullOrWhiteSpace($Message)) { $statusLabel.Text = $Message }
     foreach ($job in $script:Jobs) {
-        if ($job.Status -eq 'Ready') { $job.Status = '待重新预检' }
+        if ($job.Status -eq 'Ready') { $job.Status = 'Stale' }
+        $job.PermissionWarning = ''
     }
     Refresh-Grid
+}
+
+function Update-GeneratedTargets([string]$Reason) {
+    foreach ($job in $script:Jobs) {
+        if (-not $job.IsCustomTarget) {
+            $job.Target = Get-GeneratedTarget -Source $job.Source -Root $rootTextBox.Text -Mode (Get-StructureMode)
+        }
+    }
+    Set-PlanStale $Reason
 }
 
 function Get-WorkerConfig {
@@ -265,6 +301,172 @@ function Get-WorkerConfig {
         DeleteBackup = [bool]$deleteBackupCheckbox.Checked
         Jobs = $configJobs
     }
+}
+
+function Get-PathSecurity([string]$Path) {
+    $devicePath = ConvertTo-UiDevicePath $Path
+    if ([System.IO.Directory]::Exists($devicePath)) { return [System.IO.Directory]::GetAccessControl($devicePath) }
+    return [System.IO.File]::GetAccessControl($devicePath)
+}
+
+function Get-WritePrincipalSids($Security, [bool]$InheritedToNewSubdirectories) {
+    # 返回 DACL 中被授予写入类权限的 SID。$InheritedToNewSubdirectories=$true 时只看会继承给新建子目录的 ACE
+    # （即新建的目标目录将得到的权限），否则只看作用于该对象本身的 ACE。不计 Deny ACE：只会多报，不会漏报。
+    $sids = New-Object 'System.Collections.Generic.List[string]'
+    foreach ($rule in $Security.GetAccessRules($true, $true, [System.Security.Principal.SecurityIdentifier])) {
+        if ($rule.AccessControlType -ne [System.Security.AccessControl.AccessControlType]::Allow) { continue }
+        if (([int]$rule.FileSystemRights -band $script:WriteRightsMask) -eq 0) { continue }
+        if ($InheritedToNewSubdirectories) {
+            if (($rule.InheritanceFlags -band [System.Security.AccessControl.InheritanceFlags]::ContainerInherit) -eq 0) { continue }
+        } elseif (($rule.PropagationFlags -band [System.Security.AccessControl.PropagationFlags]::InheritOnly) -ne 0) {
+            continue
+        }
+        $sid = $rule.IdentityReference.Value
+        if (-not $sids.Contains($sid)) { $sids.Add($sid) }
+    }
+    return $sids.ToArray()
+}
+
+function Get-PrincipalDisplayName([string]$Sid) {
+    try {
+        return ([System.Security.Principal.SecurityIdentifier]::new($Sid)).Translate([System.Security.Principal.NTAccount]).Value
+    } catch {
+        return $Sid
+    }
+}
+
+function Get-ToolTamperWarning {
+    # 提权 Worker 与引擎直接从本目录加载脚本。除当前用户、SYSTEM、Administrators、TrustedInstaller 外，
+    # 任何账户或组能写入（或拥有）这些文件或目录，都能在下次提权时以管理员身份执行任意代码。
+    $trustedSids = @(
+        [System.Security.Principal.WindowsIdentity]::GetCurrent().User.Value,
+        'S-1-5-18', 'S-1-5-32-544', 'S-1-3-4',
+        'S-1-5-80-956008885-3418522649-1831038044-1853292631-2271478464'
+    )
+    $untrustedSids = New-Object 'System.Collections.Generic.List[string]'
+    foreach ($path in @($PSScriptRoot, $PSCommandPath, $script:WorkerPath, $script:EnginePath, (Join-Path $PSScriptRoot 'migrate-local-folders.cmd'))) {
+        try {
+            $security = Get-PathSecurity $path
+            $sids = @(Get-WritePrincipalSids $security $false) + @($security.GetOwner([System.Security.Principal.SecurityIdentifier]).Value)
+        } catch {
+            # 文件缺失或无法读取 ACL：跳过（缺失的脚本会在使用时另行报错）。
+            continue
+        }
+        foreach ($sid in $sids) {
+            if ($trustedSids -notcontains $sid -and -not $untrustedSids.Contains($sid)) { $untrustedSids.Add($sid) }
+        }
+    }
+    if ($untrustedSids.Count -eq 0) { return '' }
+    $names = @($untrustedSids | ForEach-Object { Get-PrincipalDisplayName $_ }) -join '、'
+    return "工具目录或其中的脚本可被以下账户或组修改：$names。`r`n这些脚本会以管理员身份运行，其他账户可借此在你下次提权时执行任意代码。`r`n建议把工具移到仅管理员可写的位置，例如 C:\Program Files\mklinktool。`r`n工具目录：$PSScriptRoot"
+}
+
+function Get-TargetPermissionWarning($Job) {
+    # 工具不复制源目录 ACL（Robocopy /COPY:DAT），目标副本会继承目标位置的权限。目标位置允许宽泛组写入、
+    # 而来源目前不允许时，迁移会扩大能修改这些数据的账户范围；若是程序目录，其他账户还可借此替换会被提权运行的文件。
+    try {
+        $ancestor = [System.IO.Path]::GetDirectoryName((ConvertTo-UiDevicePath (ConvertTo-UiFullPath ([string]$Job.Target))))
+        while (-not [string]::IsNullOrEmpty($ancestor) -and -not [System.IO.Directory]::Exists($ancestor)) {
+            $ancestor = [System.IO.Path]::GetDirectoryName($ancestor)
+        }
+        if ([string]::IsNullOrEmpty($ancestor)) { return '' }
+        $targetWriters = @(Get-WritePrincipalSids (Get-PathSecurity $ancestor) $true | Where-Object { $script:BroadPrincipalSids -contains $_ })
+        if ($targetWriters.Count -eq 0) { return '' }
+        $sourceWriters = @(Get-WritePrincipalSids (Get-PathSecurity ([string]$Job.Source)) $false)
+        $addedWriters = @($targetWriters | Where-Object { $sourceWriters -notcontains $_ })
+        if ($addedWriters.Count -eq 0) { return '' }
+        $names = @($addedWriters | ForEach-Object { Get-PrincipalDisplayName $_ }) -join '、'
+        return "权限提示：目标位置会让 $names 获得写入权限（工具不复制源目录权限），而来源目前不允许；迁移后本机其他账户可修改这些数据。若这是程序目录，还可能被用来提权。"
+    } catch {
+        # 权限检查只是提示：读不到 ACL 时不阻断流程。
+        return ''
+    }
+}
+
+function Update-PermissionWarnings {
+    $warningCount = 0
+    foreach ($job in $script:Jobs) {
+        $job.PermissionWarning = Get-TargetPermissionWarning $job
+        if (-not [string]::IsNullOrEmpty($job.PermissionWarning)) {
+            $warningCount++
+            $logTextBox.AppendText("$($job.Source)：$($job.PermissionWarning)" + [Environment]::NewLine)
+        }
+    }
+    Refresh-Grid
+    return $warningCount
+}
+
+function Get-ProcessStartStamp([int]$ProcessId) {
+    try { return [string](Get-Process -Id $ProcessId -ErrorAction Stop).StartTime.ToFileTimeUtc() } catch { return '' }
+}
+
+function Save-RecoveryJournal([string]$Path, $Journal) {
+    $temporaryPath = $Path + '.tmp'
+    [System.IO.File]::WriteAllText($temporaryPath, ($Journal | ConvertTo-Json -Depth 4), [System.Text.UTF8Encoding]::new($false))
+    if ([System.IO.File]::Exists($Path)) {
+        # 不要备份文件：必须传真正的 null。PowerShell 会把 $null 转成空串传给 .NET 的 string 参数（实测抛“路径格式非法”）。
+        [System.IO.File]::Replace($temporaryPath, $Path, [System.Management.Automation.Language.NullString]::Value)
+    } else {
+        [System.IO.File]::Move($temporaryPath, $Path)
+    }
+}
+
+function Write-RecoveryJournal([string]$SessionName, [object[]]$Jobs) {
+    # 每次迁移一个记录文件；记下所属主窗口的 PID 与启动时间，避免另一个窗口把正在进行的迁移误判为中断。
+    [void][System.IO.Directory]::CreateDirectory($script:RecoveryJournalRoot)
+    $journalPath = Join-Path $script:RecoveryJournalRoot ($SessionName + '.json')
+    $journal = [pscustomobject]@{
+        Version = 1
+        OwnerPid = $PID
+        OwnerStartTime = Get-ProcessStartStamp $PID
+        CreatedUtc = [DateTime]::UtcNow.ToString('o')
+        Jobs = @($Jobs | ForEach-Object { [pscustomobject]@{ Source = [string]$_.Source; Target = [string]$_.Target } })
+    }
+    Save-RecoveryJournal $journalPath $journal
+    return $journalPath
+}
+
+function Remove-RecoveryJournal([string]$Path) {
+    if ([string]::IsNullOrEmpty($Path)) { return }
+    try { [System.IO.File]::Delete($Path) } catch { }
+}
+
+function Test-InterruptedMigration([string]$Source) {
+    # 备份是普通目录、而原路径上什么都没有（包括失效链接）时，才是在“改名后、建链前”中断的迁移。
+    $sourcePath = $Source.TrimEnd('\')
+    if ([string]::IsNullOrWhiteSpace($sourcePath)) { return $false }
+    $backupDevicePath = ConvertTo-UiDevicePath ($sourcePath + '_migration_backup')
+    $sourceDevicePath = ConvertTo-UiDevicePath $sourcePath
+    if (-not [System.IO.Directory]::Exists($backupDevicePath)) { return $false }
+    if (([System.IO.File]::GetAttributes($backupDevicePath) -band [System.IO.FileAttributes]::ReparsePoint) -ne 0) { return $false }
+    return -not ([System.IO.Directory]::Exists($sourceDevicePath) -or [System.IO.File]::Exists($sourceDevicePath))
+}
+
+function Find-InterruptedMigrations {
+    # 返回所有“备份存在而原路径缺失”的条目，并把不再满足该条件的条目（已完成、未开始或已恢复）移出记录。
+    # 记录所属的主窗口仍在运行时整份跳过，不干扰它正在进行的迁移。
+    $found = New-Object System.Collections.ArrayList
+    if (-not [System.IO.Directory]::Exists($script:RecoveryJournalRoot)) { return }
+    foreach ($journalPath in [System.IO.Directory]::GetFiles($script:RecoveryJournalRoot, '*.json')) {
+        try {
+            $journal = [System.IO.File]::ReadAllText($journalPath, [System.Text.Encoding]::UTF8) | ConvertFrom-Json
+            if ((Get-ProcessStartStamp ([int]$journal.OwnerPid)) -eq [string]$journal.OwnerStartTime) { continue }
+            $entries = @($journal.Jobs)
+            $pending = @($entries | Where-Object { Test-InterruptedMigration ([string]$_.Source) })
+            if ($pending.Count -eq 0) {
+                [System.IO.File]::Delete($journalPath)
+            } elseif ($pending.Count -lt $entries.Count) {
+                $journal.Jobs = $pending
+                Save-RecoveryJournal $journalPath $journal
+            }
+            foreach ($entry in $pending) {
+                [void]$found.Add([pscustomobject]@{ Source = ([string]$entry.Source).TrimEnd('\'); Target = [string]$entry.Target; Status = 'Waiting'; Error = ''; Warning = '' })
+            }
+        } catch {
+            # 记录损坏或暂时无法读取：保留文件供人工检查，不影响启动。
+        }
+    }
+    return $found.ToArray()
 }
 
 function ConvertTo-WorkerMessageJson([hashtable]$Message) {
@@ -449,17 +651,44 @@ function Close-ElevatedWorker {
     $script:WorkerPipeName = ''
 }
 
+function Get-CleanupCandidates {
+    $script:Jobs | Where-Object { -not [string]::IsNullOrEmpty([string]$_.CleanupTarget) }
+}
+
+function Update-CleanupButton {
+    $cleanupButton.Enabled = (-not $script:ActiveJob) -and (@(Get-CleanupCandidates).Count -gt 0)
+}
+
 function Set-WorkerBusy([bool]$Busy) {
     $analyzeButton.Enabled = -not $Busy
     $addButton.Enabled = -not $Busy
     $removeButton.Enabled = -not $Busy
-    $grid.Enabled = -not $Busy
+    # 运行期间只锁定可编辑的目标列，保留表格滚动与悬停提示，便于查看各行进度与错误。
+    $grid.Columns['Target'].ReadOnly = $Busy
     $browseRootButton.Enabled = -not $Busy
     $rootTextBox.Enabled = -not $Busy
     $structureCombo.Enabled = -not $Busy
     $shaCheckbox.Enabled = -not $Busy
     $deleteBackupCheckbox.Enabled = -not $Busy
     $startButton.Enabled = (-not $Busy) -and $script:PlanValid
+    Update-CleanupButton
+}
+
+function Show-RestoreSummary {
+    $restoredCount = @($script:WorkerItems | Where-Object { $_.Status -eq 'Restored' }).Count
+    $lines = foreach ($item in $script:WorkerItems) {
+        $detail = if (-not [string]::IsNullOrEmpty([string]$item.Error)) { [string]$item.Error } else { [string]$item.Warning }
+        $line = '{0}：{1}' -f (Convert-StatusText ([string]$item.Status)), $item.Source
+        if (-not [string]::IsNullOrEmpty($detail)) { $line += "`r`n    $detail" }
+        $line
+    }
+    $message = $lines -join "`r`n"
+    $unprocessedCount = @($script:WorkerItems | Where-Object { $_.Status -eq 'Waiting' }).Count
+    if ($unprocessedCount -gt 0 -and $null -ne $script:WorkerState -and @($script:WorkerState.Errors).Count -gt 0) {
+        $message += "`r`n`r`n未执行的原因：" + [string]@($script:WorkerState.Errors)[-1]
+    }
+    $statusLabel.Text = "中断恢复：已恢复 $restoredCount / $(@($script:WorkerItems).Count) 项。"
+    [System.Windows.Forms.MessageBox]::Show($form, $message, '中断恢复结果', 'OK', 'Information') | Out-Null
 }
 
 function Complete-WorkerAction([int]$ExitCode, [string]$Message = '') {
@@ -470,50 +699,78 @@ function Complete-WorkerAction([int]$ExitCode, [string]$Message = '') {
     $progressBar.MarqueeAnimationSpeed = 0
     Set-WorkerBusy $false
 
+    if ($completedAction -eq 'Migrate' -and $ExitCode -eq 0 -and [string]::IsNullOrWhiteSpace($Message)) {
+        # 全部成功才移除中断恢复记录；其余情况留到下次启动，按文件系统的实际状态复查。
+        Remove-RecoveryJournal $script:WorkerJournalPath
+    }
+
     if (-not [string]::IsNullOrWhiteSpace($Message)) {
         $script:PlanValid = $false
         $startButton.Enabled = $false
         $statusLabel.Text = $Message
     } elseif ($completedAction -eq 'Analyze') {
         $script:PlanValid = ($ExitCode -eq 0)
+        $startButton.Enabled = $script:PlanValid
         if ($script:PlanValid) {
             $script:LastAnalysisSignature = Get-CurrentSignature
-            $startButton.Enabled = $true
-            $statusLabel.Text = '预检通过。检查目标路径后可以开始迁移。'
+            $permissionWarningCount = Update-PermissionWarnings
+            # 含中文弯引号的文本只能用单引号字符串：PowerShell 把“”当作双引号，会截断双引号字符串。
+            $statusLabel.Text = if ($permissionWarningCount -gt 0) { '预检通过；其中 {0} 项的目标位置允许本机其他账户写入，悬停“状态”列可查看。' -f $permissionWarningCount } else { '预检通过。检查目标路径后可以开始迁移。' }
         } else {
-            $startButton.Enabled = $false
-            $statusLabel.Text = '预检失败。请查看日志和表格中的错误。'
+            $statusLabel.Text = '预检失败。请查看表格“状态”列的错误提示和日志。'
         }
+    } elseif ($completedAction -eq 'Cleanup') {
+        $script:PlanValid = $false
+        $startButton.Enabled = $false
+        $statusLabel.Text = if ($ExitCode -eq 0) { '失败副本已清理，可以重新扫描并预检。' } else { '部分副本未能清理。请查看表格“状态”列的错误提示和日志。' }
+    } elseif ($completedAction -eq 'Restore') {
+        Show-RestoreSummary
     } else {
         $script:PlanValid = $false
         $startButton.Enabled = $false
-        $statusLabel.Text = if ($ExitCode -eq 0) { '迁移完成。请检查每项状态和日志。' } else { '迁移未全部完成。请检查错误、备份路径和目标副本。' }
+        $statusLabel.Text = if ($ExitCode -eq 0) { '迁移完成。请检查每项状态和日志。' } else { '迁移未全部完成。请检查错误、备份路径和目标副本；改名前失败遗留的副本可用“清理失败副本”删除。' }
+    }
+    if ($completedAction -eq 'Restore') {
+        # 已恢复或无需恢复的条目因原路径已存在而移出记录；恢复失败的保留，下次启动再提示。
+        [void](Find-InterruptedMigrations)
+    }
+    if ($null -ne $script:WorkerState -and [bool]$script:WorkerState.LogIncomplete) {
+        $statusLabel.Text += '（部分引擎日志未能写入）'
     }
     $script:WorkerAction = ''
+    $script:WorkerItems = @()
+    $script:WorkerJournalPath = ''
     $script:WorkerRequestId = ''
     $script:WorkerResultPath = ''
     $script:WorkerEnginePid = 0
     $script:WorkerEngineStartTime = ''
 }
 
-function Start-Worker([string]$Action) {
+function Start-Worker([string]$Action, [object[]]$Items, $Config) {
+    # $Items 与 $Config.Jobs 一一对应且顺序相同：引擎按此顺序回写序号，状态据此写回 $Items 中的对象。
     if (-not (Test-Path -LiteralPath $script:EnginePath -PathType Leaf)) {
         throw "找不到迁移引擎：$script:EnginePath"
     }
 
     $sessionName = 'mklinktool-' + [guid]::NewGuid().ToString('N')
     $sessionPath = Join-Path ([System.IO.Path]::GetTempPath()) $sessionName
+    $journalPath = ''
     $requestSent = $false
+    $requestRejected = $false
     try {
         [void][System.IO.Directory]::CreateDirectory($sessionPath)
         $configPath = Join-Path $sessionPath 'job.json'
         $statePath = Join-Path $sessionPath 'state.json'
         $logPath = Join-Path $sessionPath 'engine.log'
-        $roboLogPath = Join-Path $sessionPath 'robocopy.log'
-        $configJson = (Get-WorkerConfig | ConvertTo-Json -Depth 5)
+        $configJson = ($Config | ConvertTo-Json -Depth 5)
         [System.IO.File]::WriteAllText($configPath, $configJson, [System.Text.UTF8Encoding]::new($false))
 
         Connect-ElevatedWorker
+        if ($Action -eq 'Migrate') {
+            # 必须在发出迁移请求前落盘：迁移若在“源目录改名为备份、尚未建立链接”时被断电或强制终止，
+            # 下次启动据此检测并提示恢复。
+            $journalPath = Write-RecoveryJournal $sessionName $Items
+        }
         $requestId = [guid]::NewGuid().ToString('N')
         $resultPath = Join-Path $sessionPath ('result-{0}.json' -f $requestId)
         $request = @{
@@ -530,6 +787,7 @@ function Start-Worker([string]$Action) {
         $requestSent = $true
         $reply = Read-WorkerMessage
         if ([string]$reply.Type -eq 'Error') {
+            $requestRejected = $true
             throw "提权 Worker 拒绝了本次任务：$([string]$reply.Message)"
         }
         if ([string]$reply.Type -ne 'Accepted' -or [string]$reply.RequestId -ne $requestId -or [string]$reply.Action -ne $Action) {
@@ -537,6 +795,8 @@ function Start-Worker([string]$Action) {
         }
 
         $script:WorkerAction = $Action
+        $script:WorkerItems = $Items
+        $script:WorkerJournalPath = $journalPath
         $script:WorkerRequestId = $requestId
         $script:WorkerResultPath = $resultPath
         $script:WorkerEnginePid = [int]$reply.EnginePid
@@ -545,31 +805,80 @@ function Start-Worker([string]$Action) {
         $script:WorkerStatePath = $statePath
         $script:WorkerLogPath = $logPath
         $script:WorkerSessionPath = $sessionPath
-        $script:LogCharactersShown = 0
+        $script:LogBytesShown = 0
         $script:ActiveJob = $true
 
         Set-WorkerBusy $true
-        $statusLabel.Text = if ($Action -eq 'Analyze') { '正在后台扫描来源并检查目标…' } else { '迁移进行中…' }
+        $statusLabel.Text = switch ($Action) {
+            'Analyze' { '正在后台扫描来源并检查目标…' }
+            'Migrate' { '迁移进行中…' }
+            'Cleanup' { '正在清理失败副本…' }
+            default { '正在恢复中断的迁移…' }
+        }
         $progressBar.Style = 'Marquee'
         $progressBar.MarqueeAnimationSpeed = 25
         $script:WorkerTimer.Start()
     } catch {
-        if (-not $requestSent) {
-            # 任务请求尚未发出：Worker 不可能已在处理本会话，可安全清理会话目录。
+        if (-not $requestSent -or $requestRejected) {
+            # 任务未被 Worker 接受：不可能已在处理本会话，可安全清理会话目录与中断恢复记录。
             try { [System.IO.Directory]::Delete($sessionPath, $true) } catch { }
+            Remove-RecoveryJournal $journalPath
         }
         throw
+    }
+}
+
+function Read-WorkerLogDelta {
+    # 必须以 ReadWrite|Delete 共享打开：只允许读共享的句柄会让引擎同时进行的追加写因共享冲突而失败。
+    # 按字节偏移增量读取，只消费到最后一个换行符，避免在半行或多字节字符中间截断。
+    $share = [System.IO.FileShare]::ReadWrite -bor [System.IO.FileShare]::Delete
+    $stream = [System.IO.FileStream]::new($script:WorkerLogPath, [System.IO.FileMode]::Open, [System.IO.FileAccess]::Read, $share)
+    try {
+        $available = $stream.Length - $script:LogBytesShown
+        if ($available -le 0) { return '' }
+        [void]$stream.Seek($script:LogBytesShown, [System.IO.SeekOrigin]::Begin)
+        $buffer = New-Object byte[] ([int]$available)
+        $count = 0
+        while ($count -lt $buffer.Length) {
+            $read = $stream.Read($buffer, $count, $buffer.Length - $count)
+            if ($read -le 0) { break }
+            $count += $read
+        }
+        if ($count -le 0) { return '' }
+        $lastNewLine = [Array]::LastIndexOf($buffer, [byte]10, $count - 1)
+        if ($lastNewLine -lt 0) { return '' }
+        $script:LogBytesShown += $lastNewLine + 1
+        return [System.Text.Encoding]::UTF8.GetString($buffer, 0, $lastNewLine + 1)
+    } finally {
+        $stream.Dispose()
+    }
+}
+
+function Update-WorkerItem($Item, $Result) {
+    $Item.Status = [string]$Result.Status
+    $Item.Error = [string]$Result.Error
+    $Item.Warning = [string]$Result.Warning
+    if ($null -ne $Result.PSObject.Properties['FileCount']) {
+        $Item.FileCount = [int]$Result.FileCount
+        $Item.TotalBytes = [long]$Result.TotalBytes
+        $Item.JunctionCount = [int]$Result.JunctionCount
+        $Item.SymbolicLinkCount = [int]$Result.SymbolicLinkCount
+        $Item.AbsoluteLinkCount = [int]$Result.AbsoluteLinkCount
+    }
+    if ($script:WorkerAction -eq 'Migrate' -and $Item.Status -in @('Failed', 'RolledBack')) {
+        # 改名前失败或已回滚：来源仍完好，遗留的目标副本可用“清理失败副本”删除。
+        $Item.CleanupTarget = [string]$Result.Target
+    } elseif ($script:WorkerAction -eq 'Cleanup' -and $Item.Status -eq 'Cleaned') {
+        $Item.CleanupTarget = ''
     }
 }
 
 function Update-WorkerView {
     if (-not [string]::IsNullOrWhiteSpace($script:WorkerLogPath) -and [System.IO.File]::Exists($script:WorkerLogPath)) {
         try {
-            $content = [System.IO.File]::ReadAllText($script:WorkerLogPath, [System.Text.Encoding]::UTF8)
-            if ($content.Length -gt $script:LogCharactersShown) {
-                $delta = $content.Substring($script:LogCharactersShown)
-                $logTextBox.AppendText($delta + [Environment]::NewLine)
-                $script:LogCharactersShown = $content.Length
+            $delta = Read-WorkerLogDelta
+            if ($delta.Length -gt 0) {
+                $logTextBox.AppendText($delta)
                 $logTextBox.SelectionStart = $logTextBox.TextLength
                 $logTextBox.ScrollToCaret()
             }
@@ -594,18 +903,11 @@ function Update-WorkerView {
             }
             $script:WorkerState = $state
             foreach ($resultJob in @($state.Jobs)) {
-                foreach ($job in $script:Jobs) {
-                    # 引擎写入前已对路径做规范化，UI 必须用同一形态比较，否则匹配失败。
-                    if ([string]::Equals((Get-PathCompareKey $job.Source), (Get-PathCompareKey ([string]$resultJob.Source)), [System.StringComparison]::OrdinalIgnoreCase) -and [string]::Equals((Get-PathCompareKey $job.Target), (Get-PathCompareKey ([string]$resultJob.Target)), [System.StringComparison]::OrdinalIgnoreCase)) {
-                        $job.FileCount = [int]$resultJob.FileCount
-                        $job.TotalBytes = [long]$resultJob.TotalBytes
-                        $job.JunctionCount = [int]$resultJob.JunctionCount
-                        $job.SymbolicLinkCount = [int]$resultJob.SymbolicLinkCount
-                        $job.AbsoluteLinkCount = [int]$resultJob.AbsoluteLinkCount
-                        $job.Warning = [string]$resultJob.Warning
-                        $job.Status = Convert-StatusText ([string]$resultJob.Status)
-                        $job.Error = [string]$resultJob.Error
-                    }
+                # 引擎按 job.json 的顺序回写序号：按序号匹配，不依赖两侧路径规范化（8.3、..、末尾点等）一致。
+                if ($null -eq $resultJob.Index) { continue }
+                $itemIndex = [int]$resultJob.Index
+                if ($itemIndex -ge 0 -and $itemIndex -lt $script:WorkerItems.Count) {
+                    Update-WorkerItem $script:WorkerItems[$itemIndex] $resultJob
                 }
             }
             Refresh-Grid
@@ -757,10 +1059,17 @@ $openLogsButton.Location = New-Object System.Drawing.Point(278, 136)
 $openLogsButton.Size = New-Object System.Drawing.Size(120, 34)
 $form.Controls.Add($openLogsButton)
 
+$cleanupButton = New-Object System.Windows.Forms.Button
+$cleanupButton.Text = '清理失败副本'
+$cleanupButton.Location = New-Object System.Drawing.Point(409, 136)
+$cleanupButton.Size = New-Object System.Drawing.Size(120, 34)
+$cleanupButton.Enabled = $false
+$form.Controls.Add($cleanupButton)
+
 $statusLabel = New-Object System.Windows.Forms.Label
 $statusLabel.Text = '可将一个或多个来源文件夹直接拖入窗口，或使用“添加来源文件夹”。'
-$statusLabel.Location = New-Object System.Drawing.Point(416, 144)
-$statusLabel.Size = New-Object System.Drawing.Size(730, 22)
+$statusLabel.Location = New-Object System.Drawing.Point(540, 144)
+$statusLabel.Size = New-Object System.Drawing.Size(606, 22)
 $statusLabel.Anchor = 'Top,Left,Right'
 $form.Controls.Add($statusLabel)
 
@@ -832,6 +1141,16 @@ $form.Controls.Add($logTextBox)
 $interactionToolTip = New-Object System.Windows.Forms.ToolTip
 $interactionToolTip.SetToolTip($grid, 'Ctrl+单击或 Shift+单击可多选；右键来源或目标路径可打开菜单。')
 $interactionToolTip.SetToolTip($addButton, '添加一个或多个文件夹；也可以从资源管理器直接拖入窗口或列表。')
+$interactionToolTip.SetToolTip($cleanupButton, '删除迁移在改名前失败或已回滚后遗留的目标副本；只在来源仍完好保留在原位置时才会删除。')
+
+# 启动时检查工具目录与脚本的写入权限：会被提权运行的脚本若可被其他账户修改，就构成提权执行面。
+$toolTamperWarning = Get-ToolTamperWarning
+if (-not [string]::IsNullOrEmpty($toolTamperWarning)) {
+    $linkHintLabel.Text = '安全警告：工具目录可被其他账户修改，悬停查看详情。'
+    $linkHintLabel.ForeColor = [System.Drawing.Color]::Firebrick
+    $interactionToolTip.SetToolTip($linkHintLabel, $toolTamperWarning)
+    $logTextBox.AppendText('安全警告：' + $toolTamperWarning + [Environment]::NewLine)
+}
 
 
 
@@ -856,7 +1175,7 @@ $resetTargetMenuItem.Add_Click({
         $job = $row.Tag
         if ($null -eq $job) { continue }
         $job.IsCustomTarget = $false
-        $job.Target = Get-GeneratedTarget -Source $job.Source -Root $rootTextBox.Text -Mode $(if ($structureCombo.SelectedIndex -eq 1) { 'Categorized' } else { 'Flat' })
+        $job.Target = Get-GeneratedTarget -Source $job.Source -Root $rootTextBox.Text -Mode (Get-StructureMode)
         $resetCount++
     }
     if ($resetCount -gt 0) {
@@ -901,26 +1220,8 @@ $browseRootButton.Add_Click({
     }
 })
 
-$rootTextBox.Add_TextChanged({
-    foreach ($job in $script:Jobs) {
-        if (-not $job.IsCustomTarget) {
-            $job.Target = Get-GeneratedTarget -Source $job.Source -Root $rootTextBox.Text -Mode $(if ($structureCombo.SelectedIndex -eq 1) { 'Categorized' } else { 'Flat' })
-        }
-    }
-    Set-PlanStale '目标根目录已更改，请重新扫描并预检。'
-})
-
-$structureCombo.Add_SelectedIndexChanged({
-    foreach ($job in $script:Jobs) {
-        if (-not $job.IsCustomTarget) {
-            $job.Target = Get-GeneratedTarget -Source $job.Source -Root $rootTextBox.Text -Mode $(if ($structureCombo.SelectedIndex -eq 1) { 'Categorized' } else { 'Flat' })
-        }
-    }
-    Set-PlanStale '目标结构已更改，请重新扫描并预检。'
-})
-
-$shaCheckbox.Add_CheckedChanged({ Set-PlanStale '校验设置已更改，请重新扫描并预检。' })
-$deleteBackupCheckbox.Add_CheckedChanged({ Set-PlanStale '备份清理设置已更改，请重新扫描并预检。' })
+$rootTextBox.Add_TextChanged({ Update-GeneratedTargets '目标根目录已更改，请重新扫描并预检。' })
+$structureCombo.Add_SelectedIndexChanged({ Update-GeneratedTargets '目标结构已更改，请重新扫描并预检。' })
 
 $addButton.Add_Click({
     $folderDialog.Description = '选择要迁移的来源文件夹'
@@ -949,20 +1250,32 @@ $grid.Add_CellMouseDown({
     $resetTargetMenuItem.Enabled = -not (Test-WorkerActive)
     $openPathMenuItem.Enabled = -not [string]::IsNullOrWhiteSpace($script:ContextPath)
     $copyPathMenuItem.Enabled = -not [string]::IsNullOrWhiteSpace($script:ContextPath)
-    $pathContextMenu.Show($grid, (New-Object System.Drawing.Point($eventArgs.X, $eventArgs.Y)))
+    # CellMouseDown 的 X/Y 相对于单元格而不是表格，直接在光标处弹出菜单。
+    $pathContextMenu.Show([System.Windows.Forms.Cursor]::Position)
 })
 
 $grid.Add_CellEndEdit({
     param($sender, $eventArgs)
     if ($eventArgs.RowIndex -lt 0 -or $eventArgs.ColumnIndex -ne $grid.Columns['Target'].Index) { return }
     $job = $grid.Rows[$eventArgs.RowIndex].Tag
-    $rawTarget = [string]$grid.Rows[$eventArgs.RowIndex].Cells['Target'].Value
-    # 仅归一斜杠方向与末尾反斜杠，与引擎写入 state.json 的形态保持一致；
-    # 不调用 GetFullPath，避免把相对路径绑定到 GUI 进程 cwd 而绕过引擎的明确拒绝。
-    $job.Target = $rawTarget.Replace('/', '\').TrimEnd('\')
-    $grid.Rows[$eventArgs.RowIndex].Cells['Target'].Value = $job.Target
-    $job.IsCustomTarget = $true
-    $job.Status = '待预检'
+    $targetCell = $grid.Rows[$eventArgs.RowIndex].Cells['Target']
+    # 仅归一首尾空白、斜杠方向与末尾反斜杠；不调用 GetFullPath，避免把相对路径绑定到 GUI 进程 cwd 而绕过引擎的明确拒绝。
+    $editedTarget = ([string]$targetCell.Value).Trim().Replace('/', '\').TrimEnd('\')
+    if ([string]::Equals($editedTarget, [string]$job.Target, [System.StringComparison]::OrdinalIgnoreCase)) {
+        # 进入编辑后未改动（含按 Esc 取消）也会触发 CellEndEdit：不标记为自定义，也不作废预检结果。
+        $targetCell.Value = $job.Target
+        return
+    }
+    if ([string]::IsNullOrEmpty($editedTarget)) {
+        # 清空目标视为恢复自动生成。
+        $job.IsCustomTarget = $false
+        $job.Target = Get-GeneratedTarget -Source $job.Source -Root $rootTextBox.Text -Mode (Get-StructureMode)
+    } else {
+        $job.IsCustomTarget = $true
+        $job.Target = $editedTarget
+    }
+    $targetCell.Value = $job.Target
+    $job.Status = 'NotChecked'
     $job.Error = ''
     Set-PlanStale '目标路径已手动调整，请重新扫描并预检。'
 })
@@ -976,10 +1289,20 @@ $analyzeButton.Add_Click({
         [System.Windows.Forms.MessageBox]::Show('请先选择目标根目录。', 'mklinktool', 'OK', 'Warning') | Out-Null
         return
     }
+    try {
+        Start-Worker 'Analyze' @($script:Jobs) (Get-WorkerConfig)
+    } catch {
+        $statusLabel.Text = '无法启动提权 Worker 或预检任务。'
+        [System.Windows.Forms.MessageBox]::Show($_.Exception.Message, 'mklinktool', 'OK', 'Error') | Out-Null
+        return
+    }
+    # 任务被接受后才清空上一轮结果：启动失败（如取消 UAC）时保留原有数据与状态，确认框中的统计不会变成 0。
+    # 计时器的首次刷新发生在本处理程序返回之后，不会与这里的清空交错。
     foreach ($job in $script:Jobs) {
-        $job.Status = '等待扫描'
+        $job.Status = 'Queued'
         $job.Error = ''
         $job.Warning = ''
+        $job.PermissionWarning = ''
         $job.FileCount = 0
         $job.TotalBytes = 0L
         $job.JunctionCount = 0
@@ -988,10 +1311,6 @@ $analyzeButton.Add_Click({
     }
     Refresh-Grid
     $logTextBox.Clear()
-    try { Start-Worker 'Analyze' } catch {
-        $statusLabel.Text = '无法启动提权 Worker 或预检任务。'
-        [System.Windows.Forms.MessageBox]::Show($_.Exception.Message, 'mklinktool', 'OK', 'Error') | Out-Null
-    }
 })
 
 $startButton.Add_Click({
@@ -1017,12 +1336,34 @@ $startButton.Add_Click({
             $nestedLinkNotice += "`r`n其中 $totalAbsoluteLinks 个绝对目标链接依赖原来源路径持续保留为顶层 SymbolicLink。"
         }
     }
-    $summary = "即将处理 $($script:Jobs.Count) 个目录，总计约 $(Format-Bytes $totalBytes)。`r`n顶层链接类型：SymbolicLink。$nestedLinkNotice`r`n$backupAction`r`n`r`n目标路径和源路径都将按当前表格内容处理。确认开始？"
+    $permissionWarningCount = @($script:Jobs | Where-Object { -not [string]::IsNullOrEmpty([string]$_.PermissionWarning) }).Count
+    $permissionNotice = if ($permissionWarningCount -gt 0) { "`r`n" + ('其中 {0} 项的目标位置允许本机其他账户写入（工具不复制源目录权限），详见“状态”列提示。' -f $permissionWarningCount) } else { '' }
+    $summary = "即将处理 $($script:Jobs.Count) 个目录，总计约 $(Format-Bytes $totalBytes)。`r`n顶层链接类型：SymbolicLink。$nestedLinkNotice$permissionNotice`r`n$backupAction`r`n`r`n目标路径和源路径都将按当前表格内容处理。确认开始？"
     $answer = [System.Windows.Forms.MessageBox]::Show($summary, '确认迁移', 'YesNo', 'Warning')
     if ($answer -ne [System.Windows.Forms.DialogResult]::Yes) { return }
-    $logTextBox.Clear()
-    try { Start-Worker 'Migrate' } catch {
+    try {
+        Start-Worker 'Migrate' @($script:Jobs) (Get-WorkerConfig)
+        $logTextBox.Clear()
+    } catch {
         $statusLabel.Text = '无法启动提权 Worker 或迁移任务。'
+        [System.Windows.Forms.MessageBox]::Show($_.Exception.Message, 'mklinktool', 'OK', 'Error') | Out-Null
+    }
+})
+
+$cleanupButton.Add_Click({
+    $candidates = @(Get-CleanupCandidates)
+    if ($candidates.Count -eq 0) { return }
+    $listed = @($candidates | Select-Object -First 8 | ForEach-Object { $_.CleanupTarget })
+    $more = if ($candidates.Count -gt $listed.Count) { "`r`n…等共 $($candidates.Count) 项" } else { '' }
+    $message = "以下目标副本是迁移在改名前失败或已回滚后遗留的，对应来源仍在原位置：`r`n" + ($listed -join "`r`n") + $more +
+        "`r`n`r`n删除前引擎会再次确认：来源仍是原路径上的普通目录、不存在迁移备份、副本本身不是链接；不满足的项不会删除。需要管理员权限。`r`n确认删除这些副本？"
+    if ([System.Windows.Forms.MessageBox]::Show($message, '清理失败副本', 'YesNo', 'Warning') -ne [System.Windows.Forms.DialogResult]::Yes) { return }
+    $config = [pscustomobject]@{ Jobs = @($candidates | ForEach-Object { [pscustomobject]@{ Source = $_.Source; Target = $_.CleanupTarget } }) }
+    try {
+        Start-Worker 'Cleanup' $candidates $config
+        $logTextBox.Clear()
+    } catch {
+        $statusLabel.Text = '无法启动提权 Worker 或清理任务。'
         [System.Windows.Forms.MessageBox]::Show($_.Exception.Message, 'mklinktool', 'OK', 'Error') | Out-Null
     }
 })
@@ -1037,7 +1378,8 @@ $openLogsButton.Add_Click({
 
 $dragEnterHandler = {
     param($sender, $eventArgs)
-    if ($eventArgs.Data.GetDataPresent([System.Windows.Forms.DataFormats]::FileDrop)) {
+    # 运行期间表格保持可用（便于滚动查看），因此在这里显式拒绝拖放。
+    if (-not (Test-WorkerActive) -and $eventArgs.Data.GetDataPresent([System.Windows.Forms.DataFormats]::FileDrop)) {
         $eventArgs.Effect = [System.Windows.Forms.DragDropEffects]::Copy
     } else {
         $eventArgs.Effect = [System.Windows.Forms.DragDropEffects]::None
@@ -1060,6 +1402,29 @@ $form.Add_DragEnter($dragEnterHandler)
 $form.Add_DragDrop($dragDropHandler)
 $grid.Add_DragEnter($dragEnterHandler)
 $grid.Add_DragDrop($dragDropHandler)
+$form.Add_Shown({
+    # 检测上次在“源目录已改名为备份、尚未创建链接”时中断（断电、强制结束）的迁移，提示把备份改回原路径。
+    $interrupted = @(Find-InterruptedMigrations)
+    if ($interrupted.Count -eq 0) { return }
+    $listed = @($interrupted | Select-Object -First 6 | ForEach-Object { "原路径：$($_.Source)`r`n备份：$($_.Source)_migration_backup" })
+    $more = if ($interrupted.Count -gt $listed.Count) { "`r`n`r`n…等共 $($interrupted.Count) 项" } else { '' }
+    $newLine = [Environment]::NewLine
+    $message = ('检测到 {0} 项迁移在“源目录已改名为备份、尚未创建链接”时中断，原路径目前不存在：' -f $interrupted.Count) + $newLine + $newLine +
+        ($listed -join ($newLine + $newLine)) + $more + $newLine + $newLine +
+        '是否现在把备份改回原路径？需要管理员权限，恢复前会再次确认原路径仍为空。' + $newLine +
+        '选择“否”不做任何改动，下次启动会再次提示；也可以按 README 的“中断恢复”手动处理。'
+    if ([System.Windows.Forms.MessageBox]::Show($form, $message, '检测到中断的迁移', 'YesNo', 'Warning') -ne [System.Windows.Forms.DialogResult]::Yes) {
+        $statusLabel.Text = "有 $($interrupted.Count) 项中断的迁移尚未恢复，下次启动会再次提示。"
+        return
+    }
+    $config = [pscustomobject]@{ Jobs = @($interrupted | ForEach-Object { [pscustomobject]@{ Source = $_.Source; Target = $_.Target } }) }
+    try {
+        Start-Worker 'Restore' $interrupted $config
+    } catch {
+        $statusLabel.Text = '无法启动提权 Worker 或恢复任务；下次启动会再次提示。'
+        [System.Windows.Forms.MessageBox]::Show($form, $_.Exception.Message, 'mklinktool', 'OK', 'Error') | Out-Null
+    }
+})
 $form.Add_FormClosing({
     param($sender, $eventArgs)
     # 系统关机时必须放行，否则会阻止 Windows 正常关机。

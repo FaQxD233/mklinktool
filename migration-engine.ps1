@@ -1,6 +1,6 @@
 ﻿param(
     [Parameter(Mandatory = $true)]
-    [ValidateSet('Analyze', 'Migrate')]
+    [ValidateSet('Analyze', 'Migrate', 'Cleanup', 'Restore')]
     [string]$Action,
 
     [Parameter(Mandatory = $true)]
@@ -22,6 +22,8 @@ Set-StrictMode -Version 2.0
 $script:Utf8NoBom = New-Object System.Text.UTF8Encoding($false)
 
 # Win32 API：长路径的 8.3 短名展开与目录符号链接创建。
+# CreateSymbolicLinkW 返回 1 字节的 BOOLEAN，必须按 I1 封送：按默认 4 字节 BOOL 读取会混入 EAX 高位残值，
+# 实测失败时返回值 0x00000500 被读成 TRUE（即曾被误认为“某些策略下返回 TRUE 但没有创建”）。
 Add-Type -TypeDefinition @'
 using System;
 using System.Runtime.InteropServices;
@@ -31,6 +33,7 @@ public static class MklinkToolWin32 {
     public static extern uint GetLongPathNameW(string lpszShortPath, StringBuilder lpszLongPath, uint cchBuffer);
 
     [DllImport("kernel32.dll", CharSet = CharSet.Unicode, SetLastError = true)]
+    [return: MarshalAs(UnmanagedType.I1)]
     public static extern bool CreateSymbolicLinkW(string lpSymlinkFileName, string lpTargetFileName, uint dwFlags);
 }
 '@
@@ -38,10 +41,12 @@ $script:State = [ordered]@{
     Action = $Action
     Phase = 'Starting'
     Success = $false
+    LogIncomplete = $false
     Jobs = @()
     Errors = @()
     Warnings = @()
 }
+$script:EngineMutex = $null
 
 function Test-EngineOutputPath([string]$Path) {
     if ([System.IO.File]::Exists($Path) -and
@@ -51,9 +56,19 @@ function Test-EngineOutputPath([string]$Path) {
 }
 
 function Write-Log([string]$Message) {
-    Test-EngineOutputPath $LogPath
+    # 日志只是辅助通道：写入失败（GUI 读取或杀毒扫描造成的短暂占用、磁盘写满、输出路径变成重解析点）
+    # 绝不能向上抛出，否则会中断迁移，甚至在提交点之后触发回滚。有限重试后仍失败则丢弃该行并标记日志不完整。
     $line = '[{0}] {1}{2}' -f (Get-Date -Format 'yyyy-MM-dd HH:mm:ss'), $Message, [Environment]::NewLine
-    [System.IO.File]::AppendAllText($LogPath, $line, $script:Utf8NoBom)
+    for ($attempt = 1; $attempt -le 3; $attempt++) {
+        try {
+            Test-EngineOutputPath $LogPath
+            [System.IO.File]::AppendAllText($LogPath, $line, $script:Utf8NoBom)
+            return
+        } catch {
+            if ($attempt -lt 3) { Start-Sleep -Milliseconds 50 }
+        }
+    }
+    $script:State.LogIncomplete = $true
 }
 
 function Write-State {
@@ -372,16 +387,31 @@ function Get-TreeSnapshot([string]$Path, [bool]$IncludeHash, [string]$AbsoluteLi
     }
 }
 
-function Remove-BackupTreeSafely([string]$Path) {
-    $backupPath = ConvertTo-FullPath $Path
-    $rootAttributes = [System.IO.File]::GetAttributes((Get-ExtendedLengthPath $backupPath))
+function Clear-ReadOnlyAttribute([string]$Path) {
+    # 只读文件会阻断 Directory.Delete(recursive)，只读目录与只读链接连单体删除也会被拒绝（已实测）。
+    # SetAttributes 作用于链接本身而不是其目标（已实测），不会改动链接指向的数据。返回清除前的属性。
+    $attributes = [System.IO.File]::GetAttributes($Path)
+    if (($attributes -band [System.IO.FileAttributes]::ReadOnly) -ne 0) {
+        [System.IO.File]::SetAttributes($Path, $attributes -band (-bnot [System.IO.FileAttributes]::ReadOnly))
+    }
+    return $attributes
+}
+
+function Remove-TreeSafely([string]$Path, [ref]$ModificationStarted) {
+    # 先逐个解除树中的重解析点本身，确认不再有链接后才递归删除，避免删除动作穿过链接触及链接目标。
+    # .NET 的递归删除遇错会继续删除其余条目，因此失败时目录往往已接近删空：调用方必须依据
+    # $ModificationStarted 区分“未作任何改动”与“可能已部分删除”，不能一律声称数据仍完整保留。
+    $rootPath = ConvertTo-FullPath $Path
+    $extendedRoot = Get-ExtendedLengthPath $rootPath
+    $rootAttributes = [System.IO.File]::GetAttributes($extendedRoot)
     if (($rootAttributes -band [System.IO.FileAttributes]::Directory) -eq 0 -or
         ($rootAttributes -band [System.IO.FileAttributes]::ReparsePoint) -ne 0) {
-        throw "备份根目录类型异常，为避免误删而停止清理：$backupPath"
+        throw "待删除的根目录不是普通目录，为避免误删而停止清理：$rootPath"
     }
 
-    $extendedRoot = Get-ExtendedLengthPath $backupPath
     $links = New-Object System.Collections.ArrayList
+    $readOnlyEntries = New-Object System.Collections.ArrayList
+    if (($rootAttributes -band [System.IO.FileAttributes]::ReadOnly) -ne 0) { [void]$readOnlyEntries.Add($extendedRoot) }
     $directories = New-Object 'System.Collections.Generic.Queue[System.IO.DirectoryInfo]'
     $directories.Enqueue([System.IO.DirectoryInfo]::new($extendedRoot))
     while ($directories.Count -gt 0) {
@@ -389,24 +419,26 @@ function Remove-BackupTreeSafely([string]$Path) {
         foreach ($entry in $directory.GetFileSystemInfos()) {
             if (($entry.Attributes -band [System.IO.FileAttributes]::ReparsePoint) -ne 0) {
                 [void]$links.Add($entry.FullName)
-            } elseif (($entry.Attributes -band [System.IO.FileAttributes]::Directory) -ne 0) {
+                continue
+            }
+            if (($entry.Attributes -band [System.IO.FileAttributes]::ReadOnly) -ne 0) { [void]$readOnlyEntries.Add($entry.FullName) }
+            if (($entry.Attributes -band [System.IO.FileAttributes]::Directory) -ne 0) {
                 $directories.Enqueue([System.IO.DirectoryInfo]::new($entry.FullName))
-            } else {
-                # 只读文件会让 Directory.Delete(recursive) 抛 UnauthorizedAccessException，先清属性。
-                if (($entry.Attributes -band [System.IO.FileAttributes]::ReadOnly) -ne 0) {
-                    [System.IO.File]::SetAttributes($entry.FullName, $entry.Attributes -band (-bnot [System.IO.FileAttributes]::ReadOnly))
-                }
             }
         }
     }
 
+    $ModificationStarted.Value = $true
     foreach ($linkPath in $links) {
-        $attributes = [System.IO.File]::GetAttributes([string]$linkPath)
+        $attributes = Clear-ReadOnlyAttribute ([string]$linkPath)
         if (($attributes -band [System.IO.FileAttributes]::Directory) -ne 0) {
             [System.IO.Directory]::Delete([string]$linkPath)
         } else {
             [System.IO.File]::Delete([string]$linkPath)
         }
+    }
+    foreach ($entryPath in $readOnlyEntries) {
+        [void](Clear-ReadOnlyAttribute ([string]$entryPath))
     }
 
     [System.IO.Directory]::Delete($extendedRoot, $true)
@@ -428,27 +460,65 @@ function Get-DriveInfoForPath([string]$Path) {
     return $drive
 }
 
+function Resolve-JobPaths([string]$SourceInput, [string]$TargetInput) {
+    # 校验并规范化一项作业的来源与目标；备份路径的命名只在此处定义，预检、清理与恢复共用。
+    if ([string]::IsNullOrWhiteSpace($SourceInput)) { throw '来源路径不能为空。' }
+    if ([string]::IsNullOrWhiteSpace($TargetInput)) { throw '目标路径不能为空。' }
+    if (-not (Test-FullyQualifiedWindowsPath $SourceInput.Replace('/', '\'))) { throw "来源路径必须是完整绝对路径（不接受 \目录 或 C:目录 形式）：$SourceInput" }
+    if (-not (Test-FullyQualifiedWindowsPath $TargetInput.Replace('/', '\'))) { throw "目标路径必须是完整绝对路径（不接受 \目录 或 C:目录 形式）：$TargetInput" }
+    $source = ConvertTo-FullPath $SourceInput
+    $target = ConvertTo-FullPath $TargetInput
+    if ([string]::Equals($source.TrimEnd('\'), ([System.IO.Path]::GetPathRoot($source)).TrimEnd('\'), [System.StringComparison]::OrdinalIgnoreCase)) {
+        throw "不能迁移磁盘根目录：$source"
+    }
+    if ([string]::Equals($target.TrimEnd('\'), ([System.IO.Path]::GetPathRoot($target)).TrimEnd('\'), [System.StringComparison]::OrdinalIgnoreCase)) {
+        throw "不能把磁盘根目录作为目标：$target"
+    }
+    return [pscustomobject]@{
+        Source = $source
+        Target = $target
+        Backup = $source + '_migration_backup'
+    }
+}
+
+function Add-AnalysisError($Analysis, [string]$Message) {
+    # 跨任务冲突、空间不足、建链能力等错误也写回到相关作业，界面才能在对应行显示原因，而不只出现在日志里。
+    $Analysis.Status = 'Error'
+    $existing = [string]$Analysis.Error
+    if ([string]::IsNullOrEmpty($existing)) {
+        $Analysis.Error = $Message
+    } elseif (-not $existing.Contains($Message)) {
+        $Analysis.Error = $existing + '；' + $Message
+    }
+}
+
 function Get-MigrationAnalysis($Config) {
     $analyses = New-Object System.Collections.ArrayList
     $errors = New-Object System.Collections.ArrayList
     $warnings = New-Object System.Collections.ArrayList
+    # 下列四个列表按同一下标对应通过单项检查的作业；$checkedIndices 记录该作业在 $analyses 中的位置。
     $sourcePaths = New-Object 'System.Collections.Generic.List[string]'
     $targetPaths = New-Object 'System.Collections.Generic.List[string]'
     $backupPaths = New-Object 'System.Collections.Generic.List[string]'
+    $checkedIndices = New-Object 'System.Collections.Generic.List[int]'
     $requiredByDrive = @{}
     [long]$reserveBytes = 1GB
 
+    $globalError = ''
     if ([string]$Config.LinkType -ne 'SymbolicLink') {
-        [void]$errors.Add("不支持的链接类型：$($Config.LinkType)。本工具只创建 SymbolicLink。")
+        $globalError = "不支持的链接类型：$($Config.LinkType)。本工具只创建 SymbolicLink。"
     } else {
-        try { [void](Test-SymbolicLinkCreation) } catch { [void]$errors.Add($_.Exception.Message) }
+        try { [void](Test-SymbolicLinkCreation) } catch { $globalError = $_.Exception.Message }
     }
+    if (-not [string]::IsNullOrEmpty($globalError)) { [void]$errors.Add($globalError) }
     if (@($Config.Jobs).Count -eq 0) {
         [void]$errors.Add('尚未添加来源目录。')
     }
 
     foreach ($job in $Config.Jobs) {
         $analysis = [ordered]@{
+            # 按 job.json 的顺序回写序号，GUI 据此匹配行，不依赖两侧路径规范化的形态一致。
+            Index = $analyses.Count
             Source = [string]$job.Source
             Target = [string]$job.Target
             Backup = ''
@@ -462,30 +532,16 @@ function Get-MigrationAnalysis($Config) {
             Error = ''
         }
         try {
-            if ([string]::IsNullOrWhiteSpace([string]$job.Source)) { throw '来源路径不能为空。' }
-            if ([string]::IsNullOrWhiteSpace([string]$job.Target)) { throw '目标路径不能为空。' }
-            $normalizedSourceInput = ([string]$job.Source).Replace('/', '\')
-            $normalizedTargetInput = ([string]$job.Target).Replace('/', '\')
-            if (-not (Test-FullyQualifiedWindowsPath $normalizedSourceInput)) { throw "来源路径必须是完整绝对路径（不接受 \目录 或 C:目录 形式）：$($job.Source)" }
-            if (-not (Test-FullyQualifiedWindowsPath $normalizedTargetInput)) { throw "目标路径必须是完整绝对路径（不接受 \目录 或 C:目录 形式）：$($job.Target)" }
-            $source = ConvertTo-FullPath ([string]$job.Source)
-            $target = ConvertTo-FullPath ([string]$job.Target)
-            $sourceRoot = [System.IO.Path]::GetPathRoot($source)
-            if ([string]::Equals($source.TrimEnd('\'), $sourceRoot.TrimEnd('\'), [System.StringComparison]::OrdinalIgnoreCase)) {
-                throw "不能迁移磁盘根目录：$source"
-            }
-            $targetRoot = [System.IO.Path]::GetPathRoot($target)
-            if ([string]::Equals($target.TrimEnd('\'), $targetRoot.TrimEnd('\'), [System.StringComparison]::OrdinalIgnoreCase)) {
-                throw "不能把磁盘根目录作为目标：$target"
-            }
+            $paths = Resolve-JobPaths ([string]$job.Source) ([string]$job.Target)
+            $source = $paths.Source
+            $target = $paths.Target
+            $backup = $paths.Backup
             if (-not [System.IO.Directory]::Exists((Get-ExtendedLengthPath $source))) {
                 throw "来源目录不存在：$source"
             }
             if (Test-PathEntryExists $target) {
                 throw "目标路径已经存在：$target"
             }
-
-            $backup = $source + '_migration_backup'
             if (Test-PathEntryExists $backup) {
                 throw "备份路径已经存在，请先处理该备份：$backup"
             }
@@ -494,6 +550,7 @@ function Get-MigrationAnalysis($Config) {
             [void]$sourcePaths.Add($source)
             [void]$targetPaths.Add($target)
             [void]$backupPaths.Add($backup)
+            $checkedIndices.Add($analyses.Count)
             $analysis.Source = $source
             $analysis.Target = $target
             $analysis.Backup = $backup
@@ -523,9 +580,10 @@ function Get-MigrationAnalysis($Config) {
 
             $driveKey = $targetDrive.Name.ToUpperInvariant()
             if (-not $requiredByDrive.ContainsKey($driveKey)) {
-                $requiredByDrive[$driveKey] = [ordered]@{ Drive = $targetDrive; Bytes = 0L }
+                $requiredByDrive[$driveKey] = [ordered]@{ Drive = $targetDrive; Bytes = 0L; Indices = (New-Object 'System.Collections.Generic.List[int]') }
             }
             $requiredByDrive[$driveKey].Bytes += [long]$snapshot.TotalBytes
+            $requiredByDrive[$driveKey].Indices.Add($analyses.Count)
         } catch {
             $analysis.Status = 'Error'
             $analysis.Error = $_.Exception.Message
@@ -539,18 +597,25 @@ function Get-MigrationAnalysis($Config) {
         Write-State
     }
 
+    function Add-ConflictError([int]$First, [int]$Second, [string]$Message) {
+        # $First/$Second 是路径列表下标；冲突双方都标出错误。
+        [void]$errors.Add($Message)
+        Add-AnalysisError $analyses[$checkedIndices[$First]] $Message
+        Add-AnalysisError $analyses[$checkedIndices[$Second]] $Message
+    }
+
     for ($i = 0; $i -lt $sourcePaths.Count; $i++) {
         for ($j = $i + 1; $j -lt $sourcePaths.Count; $j++) {
             if ((Test-PathContains $sourcePaths[$i] $sourcePaths[$j]) -or (Test-PathContains $sourcePaths[$j] $sourcePaths[$i])) {
-                [void]$errors.Add("来源目录互相包含，拒绝批量迁移：$($sourcePaths[$i]) / $($sourcePaths[$j])")
+                Add-ConflictError $i $j "来源目录互相包含，拒绝批量迁移：$($sourcePaths[$i]) / $($sourcePaths[$j])"
             }
             if ((Test-PathContains $targetPaths[$i] $targetPaths[$j]) -or (Test-PathContains $targetPaths[$j] $targetPaths[$i])) {
-                [void]$errors.Add("目标目录互相包含，拒绝批量迁移：$($targetPaths[$i]) / $($targetPaths[$j])")
+                Add-ConflictError $i $j "目标目录互相包含，拒绝批量迁移：$($targetPaths[$i]) / $($targetPaths[$j])"
             }
         }
-        foreach ($source in $sourcePaths) {
-            if ((Test-PathContains $source $targetPaths[$i]) -or (Test-PathContains $targetPaths[$i] $source)) {
-                [void]$errors.Add("来源与目标路径互相包含：$source / $($targetPaths[$i])")
+        for ($j = 0; $j -lt $sourcePaths.Count; $j++) {
+            if ((Test-PathContains $sourcePaths[$j] $targetPaths[$i]) -or (Test-PathContains $targetPaths[$i] $sourcePaths[$j])) {
+                Add-ConflictError $j $i "来源与目标路径互相包含：$($sourcePaths[$j]) / $($targetPaths[$i])"
             }
         }
     }
@@ -558,15 +623,15 @@ function Get-MigrationAnalysis($Config) {
     for ($i = 0; $i -lt $backupPaths.Count; $i++) {
         for ($j = 0; $j -lt $sourcePaths.Count; $j++) {
             if ($j -ne $i -and ((Test-PathContains $backupPaths[$i] $sourcePaths[$j]) -or (Test-PathContains $sourcePaths[$j] $backupPaths[$i]))) {
-                [void]$errors.Add("备份路径与其他来源目录互相包含，拒绝批量迁移：$($backupPaths[$i]) / $($sourcePaths[$j])")
+                Add-ConflictError $i $j "备份路径与其他来源目录互相包含，拒绝批量迁移：$($backupPaths[$i]) / $($sourcePaths[$j])"
             }
             if ((Test-PathContains $backupPaths[$i] $targetPaths[$j]) -or (Test-PathContains $targetPaths[$j] $backupPaths[$i])) {
-                [void]$errors.Add("备份路径与目标目录互相包含，拒绝批量迁移：$($backupPaths[$i]) / $($targetPaths[$j])")
+                Add-ConflictError $i $j "备份路径与目标目录互相包含，拒绝批量迁移：$($backupPaths[$i]) / $($targetPaths[$j])"
             }
         }
         for ($j = $i + 1; $j -lt $backupPaths.Count; $j++) {
             if ((Test-PathContains $backupPaths[$i] $backupPaths[$j]) -or (Test-PathContains $backupPaths[$j] $backupPaths[$i])) {
-                [void]$errors.Add("备份路径互相包含，拒绝批量迁移：$($backupPaths[$i]) / $($backupPaths[$j])")
+                Add-ConflictError $i $j "备份路径互相包含，拒绝批量迁移：$($backupPaths[$i]) / $($backupPaths[$j])"
             }
         }
     }
@@ -574,8 +639,14 @@ function Get-MigrationAnalysis($Config) {
     foreach ($driveEntry in $requiredByDrive.Values) {
         [long]$required = [long]$driveEntry.Bytes + $reserveBytes
         if ([long]$driveEntry.Drive.AvailableFreeSpace -lt $required) {
-            [void]$errors.Add("$($driveEntry.Drive.Name): 可用空间不足。需要约 $($driveEntry.Bytes) 字节并保留 1 GB，当前可用 $($driveEntry.Drive.AvailableFreeSpace) 字节。")
+            $spaceError = "$($driveEntry.Drive.Name): 可用空间不足。需要约 $($driveEntry.Bytes) 字节并保留 1 GB，当前可用 $($driveEntry.Drive.AvailableFreeSpace) 字节。"
+            [void]$errors.Add($spaceError)
+            foreach ($analysisIndex in $driveEntry.Indices) { Add-AnalysisError $analyses[$analysisIndex] $spaceError }
         }
+    }
+    if (-not [string]::IsNullOrEmpty($globalError)) {
+        # 链接类型不受支持或无法创建符号链接时，任何一项都无法迁移，逐行标出原因。
+        foreach ($analysisObject in $analyses) { Add-AnalysisError $analysisObject $globalError }
     }
 
     return [pscustomobject]@{
@@ -690,7 +761,8 @@ function Remove-VerifiedLink([string]$Path, [string]$Target, [string]$LinkType) 
 
 function Invoke-Migration($Config) {
     $analysisResult = Get-MigrationAnalysis -Config $Config
-    $script:State.Jobs = @($analysisResult.Jobs)
+    $jobs = @($analysisResult.Jobs)
+    $script:State.Jobs = $jobs
     $script:State.Errors = @($analysisResult.Errors)
     $script:State.Warnings = @($analysisResult.Warnings)
     if ($analysisResult.Errors.Count -gt 0) {
@@ -700,7 +772,8 @@ function Invoke-Migration($Config) {
         return $false
     }
 
-    foreach ($analysis in $analysisResult.Jobs) {
+    for ($jobIndex = 0; $jobIndex -lt $jobs.Count; $jobIndex++) {
+        $analysis = $jobs[$jobIndex]
         $source = [string]$analysis.Source
         $target = [string]$analysis.Target
         $backup = [string]$analysis.Backup
@@ -711,7 +784,6 @@ function Invoke-Migration($Config) {
         try {
             $analysis.Status = 'Copying'
             $script:State.Phase = 'Copying'
-            $script:State.Jobs = @($analysisResult.Jobs)
             Write-State
             Write-Log "复制：$source -> $target"
             $extendedTarget = Get-ExtendedLengthPath $target
@@ -773,21 +845,24 @@ function Invoke-Migration($Config) {
             $linkCreated = $true
             Test-CreatedLink -Path $source -Target $target -LinkType ([string]$Config.LinkType)
             Test-NestedLinksAccessible -SourceRoot $source -TargetRoot $target -Snapshot $sourceSnapshot
+            # 提交点：链接已建立并通过验证。此后任何异常都只能记录，不得回滚（见下方 catch）。
             $jobSucceeded = $true
             Write-Log '顶层 SymbolicLink 与嵌套链接的类型、目标及目录访问验证通过。'
 
             if ([bool]$Config.DeleteBackup) {
+                $backupModified = $false
                 try {
                     Write-Log "删除已验证的源备份：$backup"
-                    $removedLinkCount = Remove-BackupTreeSafely -Path $backup
+                    $removedLinkCount = Remove-TreeSafely -Path $backup -ModificationStarted ([ref]$backupModified)
                     Write-Log "备份安全清理完成：先解除 $removedLinkCount 个重解析点，再删除普通目录树。"
                     $analysis.Backup = ''
                     $analysis.Status = 'Complete'
                 } catch {
+                    $backupState = if ($backupModified) { '备份清理中途失败，剩余内容可能已不完整' } else { '备份未作改动，完整保留' }
                     $analysis.Status = 'CompleteBackupRetained'
-                    $analysis.Error = "链接已正常工作，但备份删除失败：$($_.Exception.Message)"
-                    $script:State.Warnings = @($script:State.Warnings) + @("备份仍保留：$backup。$($analysis.Error)")
-                    Write-Log "警告：链接成功，但备份未能删除，保留路径：$backup"
+                    $analysis.Error = "链接已正常工作，完整数据位于目标副本：$target。$backupState：$backup。原因：$($_.Exception.Message)"
+                    $script:State.Warnings = @($script:State.Warnings) + @($analysis.Error)
+                    Write-Log "警告：$($analysis.Error)"
                 }
             } else {
                 $analysis.Status = 'CompleteBackupRetained'
@@ -795,47 +870,61 @@ function Invoke-Migration($Config) {
             }
         } catch {
             $operationError = $_.Exception.Message
-            $analysis.Error = $operationError
-            $analysis.Status = 'Failed'
-            $script:State.Phase = 'Failed'
-            # 回滚路径中的日志失败不能中断回滚本身。
-            try { Write-Log "错误：$operationError" } catch { }
-            if ($backupCreated) {
-                try {
-                    if (Test-PathEntryExists $source) {
-                        if (-not $linkCreated) {
-                            $possibleLink = Get-Item -LiteralPath $source -Force -ErrorAction SilentlyContinue
-                            if ($null -ne $possibleLink -and $possibleLink.LinkType -eq [string]$Config.LinkType) {
-                                Remove-VerifiedLink -Path $source -Target $target -LinkType ([string]$Config.LinkType)
-                            } else {
-                                throw "源路径已被其他对象占用，未覆盖；原数据仍在备份路径：$backup"
-                            }
-                        } else {
-                            Remove-VerifiedLink -Path $source -Target $target -LinkType ([string]$Config.LinkType)
-                        }
-                    }
-                    if (Test-PathEntryExists $source) {
-                        throw "恢复目标路径仍被占用；原数据仍在：$backup"
-                    }
-                    [System.IO.Directory]::Move((Get-ExtendedLengthPath $backup), (Get-ExtendedLengthPath $source))
-                    $analysis.Backup = ''
-                    $analysis.Status = 'RolledBack'
-                    $script:State.Errors = @($script:State.Errors) + @("迁移失败，已自动回滚恢复原源目录。来源：$source；目标副本保留：$target。原因：$operationError")
-                    try { Write-Log '链接步骤失败；已通过同目录改名恢复原源路径，目标副本保留。' } catch { }
-                } catch {
-                    $analysis.Status = 'RecoveryRequired'
-                    $analysis.Error = "$operationError；自动恢复也失败：$($_.Exception.Message)"
-                    $script:State.Errors = @($script:State.Errors) + @("需要人工恢复。备份：$backup；目标副本：$target。$($analysis.Error)")
-                    try { Write-Log "严重错误：自动恢复未完成。备份数据仍在 $backup；目标副本仍在 $target。$($_.Exception.Message)" } catch { }
-                }
+            if ($jobSucceeded) {
+                # 提交点之后回滚会删除正在工作的链接；若备份已被部分删除，还会把残缺目录改回原路径。只记录警告。
+                if ($analysis.Status -ne 'Complete') { $analysis.Status = 'CompleteBackupRetained' }
+                $analysis.Error = "链接已正常工作，但收尾步骤出错：$operationError"
+                $script:State.Warnings = @($script:State.Warnings) + @("$source：$($analysis.Error)")
+                Write-Log "警告：$source 收尾步骤出错，链接保持不变：$operationError"
             } else {
-                $script:State.Errors = @($script:State.Errors) + @($operationError)
+                $analysis.Error = $operationError
+                $analysis.Status = 'Failed'
+                $script:State.Phase = 'Failed'
+                Write-Log "错误：$operationError"
+                if ($backupCreated) {
+                    try {
+                        if (Test-PathEntryExists $source) {
+                            if (-not $linkCreated) {
+                                # Get-Item 不支持长路径，统一用扩展路径的 DirectoryInfo 读取链接类型。
+                                $possibleLink = [System.IO.DirectoryInfo]::new((Get-ExtendedLengthPath $source))
+                                if ([string]$possibleLink.LinkType -eq [string]$Config.LinkType) {
+                                    Remove-VerifiedLink -Path $source -Target $target -LinkType ([string]$Config.LinkType)
+                                } else {
+                                    throw "源路径已被其他对象占用，未覆盖；原数据仍在备份路径：$backup"
+                                }
+                            } else {
+                                Remove-VerifiedLink -Path $source -Target $target -LinkType ([string]$Config.LinkType)
+                            }
+                        }
+                        if (Test-PathEntryExists $source) {
+                            throw "恢复目标路径仍被占用；原数据仍在：$backup"
+                        }
+                        [System.IO.Directory]::Move((Get-ExtendedLengthPath $backup), (Get-ExtendedLengthPath $source))
+                        $analysis.Backup = ''
+                        $analysis.Status = 'RolledBack'
+                        $script:State.Errors = @($script:State.Errors) + @("迁移失败，已自动回滚恢复原源目录。来源：$source；目标副本保留：$target。原因：$operationError")
+                        Write-Log '链接步骤失败；已通过同目录改名恢复原源路径，目标副本保留。'
+                    } catch {
+                        $analysis.Status = 'RecoveryRequired'
+                        $analysis.Error = "$operationError；自动恢复也失败：$($_.Exception.Message)"
+                        $script:State.Errors = @($script:State.Errors) + @("需要人工恢复。备份：$backup；目标副本：$target。$($analysis.Error)")
+                        Write-Log "严重错误：自动恢复未完成。备份数据仍在 $backup；目标副本仍在 $target。$($_.Exception.Message)"
+                    }
+                } else {
+                    $script:State.Errors = @($script:State.Errors) + @($operationError)
+                }
             }
         }
 
-        $script:State.Jobs = @($analysisResult.Jobs)
         Write-State
-        if (-not $jobSucceeded) { return $false }
+        if (-not $jobSucceeded) {
+            # 本项失败即停止；把尚未执行的作业明确标为“未执行”，避免界面残留“预检通过”。
+            for ($remainingIndex = $jobIndex + 1; $remainingIndex -lt $jobs.Count; $remainingIndex++) {
+                $jobs[$remainingIndex].Status = 'NotStarted'
+            }
+            Write-State
+            return $false
+        }
     }
 
     $script:State.Success = $true
@@ -843,6 +932,118 @@ function Invoke-Migration($Config) {
     Write-Log '所有目录均已完成迁移。'
     Write-State
     return $true
+}
+
+function Enter-EngineLock {
+    # 迁移、清理、恢复都会改动来源或目标：同一时间只允许一个此类引擎运行，防止在“改名后、建链前”的
+    # 窗口里恢复备份、在复制进行中清理目标，或两个窗口并发迁移同一来源。锁在引擎退出时释放。
+    try {
+        $script:EngineMutex = [System.Threading.Mutex]::new($false, 'Global\mklinktool-engine')
+    } catch [System.UnauthorizedAccessException] {
+        throw '另一个迁移、清理或恢复任务正在运行（无法访问其互斥锁），请等待它结束后再试。'
+    }
+    $acquired = $false
+    try {
+        $acquired = $script:EngineMutex.WaitOne(0)
+    } catch [System.Threading.AbandonedMutexException] {
+        # 上一个持有者异常退出：互斥锁已转归当前进程。
+        $acquired = $true
+    }
+    if (-not $acquired) {
+        $script:EngineMutex.Dispose()
+        $script:EngineMutex = $null
+        throw '另一个迁移、清理或恢复任务正在运行，请等待它结束后再试。'
+    }
+}
+
+function ConvertTo-ActionItems($Config) {
+    $index = 0
+    foreach ($job in @($Config.Jobs)) {
+        [pscustomobject][ordered]@{ Index = $index; Source = [string]$job.Source; Target = [string]$job.Target; Status = 'Waiting'; Error = ''; Warning = '' }
+        $index++
+    }
+}
+
+function Invoke-ItemAction($Config, [string]$Phase, [string]$RunningStatus, [string]$FailedStatus, [scriptblock]$Operation) {
+    # 清理与恢复共用：逐项校验路径后执行 $Operation，单项失败不影响其余项，状态逐项写回供界面显示。
+    $items = @(ConvertTo-ActionItems $Config)
+    $script:State.Jobs = $items
+    $script:State.Phase = $Phase
+    Write-State
+    foreach ($item in $items) {
+        $item.Status = $RunningStatus
+        Write-State
+        try {
+            $paths = Resolve-JobPaths $item.Source $item.Target
+            $null = & $Operation $item $paths
+        } catch {
+            $item.Status = $FailedStatus
+            $item.Error = $_.Exception.Message
+            $script:State.Errors = @($script:State.Errors) + @("$($item.Source)：$($item.Error)")
+            Write-Log "失败：$($item.Source)：$($item.Error)"
+        }
+        Write-State
+    }
+    $script:State.Success = (@($items | Where-Object { $_.Status -eq $FailedStatus }).Count -eq 0)
+    $script:State.Phase = if ($script:State.Success) { 'Complete' } else { 'Failed' }
+    Write-State
+    return $script:State.Success
+}
+
+function Invoke-TargetCleanup($Config) {
+    # 清理迁移在改名前失败或已回滚后遗留的目标副本。只在来源仍以普通目录完好保留在原路径、且不存在
+    # 迁移备份时删除，确保被删除的副本不可能是数据唯一的完整拷贝。
+    return Invoke-ItemAction $Config 'Cleaning' 'Cleaning' 'CleanupFailed' {
+        param($Item, $Paths)
+        if (-not (Test-PathEntryExists $Paths.Target)) {
+            $Item.Status = 'Cleaned'
+            $Item.Warning = '目标副本已不存在，无需清理。'
+            return
+        }
+        $extendedSource = Get-ExtendedLengthPath $Paths.Source
+        if (-not [System.IO.Directory]::Exists($extendedSource) -or
+            ([System.IO.File]::GetAttributes($extendedSource) -band [System.IO.FileAttributes]::ReparsePoint) -ne 0) {
+            throw "来源不是原路径上的普通目录，目标副本可能是唯一的完整数据，拒绝清理：$($Paths.Source)"
+        }
+        if (Test-PathEntryExists $Paths.Backup) {
+            throw "存在迁移备份，状态不明确，拒绝清理：$($Paths.Backup)"
+        }
+        if ((Test-PathContains $Paths.Source $Paths.Target) -or (Test-PathContains $Paths.Target $Paths.Source)) {
+            throw "来源与目标互相包含，拒绝清理：$($Paths.Source) / $($Paths.Target)"
+        }
+        $targetModified = $false
+        try {
+            [void](Remove-TreeSafely -Path $Paths.Target -ModificationStarted ([ref]$targetModified))
+        } catch {
+            if ($targetModified) { throw "目标副本未能完全删除（可能已部分删除）：$($Paths.Target)。原因：$($_.Exception.Message)" }
+            throw
+        }
+        $Item.Status = 'Cleaned'
+        Write-Log "已删除失败遗留的目标副本：$($Paths.Target)"
+    }
+}
+
+function Invoke-BackupRestore($Config) {
+    # 恢复在“源目录已改名为备份、尚未建立链接”时中断的迁移：仅当原路径上确实没有任何对象、
+    # 且备份是普通目录时，把备份改回原名；原路径已有对象则不做任何改动。
+    return Invoke-ItemAction $Config 'Restoring' 'Restoring' 'RestoreFailed' {
+        param($Item, $Paths)
+        if (Test-PathEntryExists $Paths.Source) {
+            $Item.Status = 'RestoreSkipped'
+            $Item.Warning = '原路径上已有对象（迁移可能已完成或已手动恢复），未做改动。'
+            return
+        }
+        $extendedBackup = Get-ExtendedLengthPath $Paths.Backup
+        if (-not [System.IO.Directory]::Exists($extendedBackup)) {
+            throw "找不到迁移备份：$($Paths.Backup)"
+        }
+        if (([System.IO.File]::GetAttributes($extendedBackup) -band [System.IO.FileAttributes]::ReparsePoint) -ne 0) {
+            throw "迁移备份路径是链接而不是目录，拒绝恢复：$($Paths.Backup)"
+        }
+        [System.IO.Directory]::Move($extendedBackup, (Get-ExtendedLengthPath $Paths.Source))
+        $Item.Status = 'Restored'
+        Write-Log "已把迁移备份改回原路径：$($Paths.Backup) -> $($Paths.Source)"
+    }
 }
 
 try {
@@ -875,7 +1076,12 @@ try {
         Write-State
         if (-not $script:State.Success) { exit 1 }
     } else {
-        $success = Invoke-Migration -Config $config
+        Enter-EngineLock
+        $success = switch ($Action) {
+            'Migrate' { Invoke-Migration -Config $config }
+            'Cleanup' { Invoke-TargetCleanup -Config $config }
+            'Restore' { Invoke-BackupRestore -Config $config }
+        }
         if (-not $success) { exit 1 }
     }
     exit 0
@@ -883,9 +1089,13 @@ try {
     $script:State.Success = $false
     $script:State.Phase = 'Failed'
     $script:State.Errors = @($script:State.Errors) + @($_.Exception.Message)
-    try {
-        Write-Log "引擎异常：$($_.Exception.Message)"
-        Write-State
-    } catch { }
+    Write-Log "引擎异常：$($_.Exception.Message)"
+    try { Write-State } catch { }
     exit 1
+} finally {
+    # exit 时 finally 仍会执行（已实测）；进程退出本身也会释放互斥锁，此处只是尽早释放。
+    if ($null -ne $script:EngineMutex) {
+        try { $script:EngineMutex.ReleaseMutex() } catch { }
+        $script:EngineMutex.Dispose()
+    }
 }

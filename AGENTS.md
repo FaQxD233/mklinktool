@@ -4,12 +4,13 @@
 
 ## 项目架构速览
 
-- `migrate-local-folders.ps1`：GUI（WinForms，STA，非提权）。命名管道服务端，轮询 `state.json` 刷新界面。
-- `migration-worker.ps1`：经 UAC 启动的提权 Worker。校验父进程 PID 后连接命名管道，按 `Execute{RequestId, Action, SessionPath, SessionTempRoot}` 拉起引擎子进程，结束后写 `result-<RequestId>.json`。
-- `migration-engine.ps1`：实际执行预检（robocopy 复制 + 校验 + 源目录改名备份 + 建顶层 SymbolicLink）。
-- 会话目录：`%TEMP%\mklinktool-<guid>\`（job.json / state.json / engine.log / robocopy.log）。
+- `migrate-local-folders.ps1`：GUI（WinForms，STA，非提权）。命名管道服务端，轮询 `state.json` 刷新界面。启动时检查工具目录权限（可被其他账户修改则红色警告）与中断恢复记录。
+- `migration-worker.ps1`：经 UAC 启动的提权 Worker。校验父进程 PID 后连接命名管道，按 `Execute{RequestId, Action, SessionPath, SessionTempRoot}` 拉起引擎子进程，结束后写 `result-<RequestId>.json`。Action 白名单：Analyze / Migrate / Cleanup / Restore。
+- `migration-engine.ps1`：Analyze（预检）、Migrate（robocopy 复制 + 校验 + 源目录改名备份 + 建顶层 SymbolicLink + 删除备份）、Cleanup（删除改名前失败或已回滚遗留的目标副本）、Restore（把中断迁移的备份改回原路径）。后三者持有 `Global\mklinktool-engine` 互斥锁。
+- **提交点**：Migrate 中链接建立并验证通过后即视为提交（`$jobSucceeded`），之后的任何异常只能记警告、不得回滚——回滚会删掉正在工作的链接，若备份已被部分删除还会把残缺目录改回原路径（2026-10-14 故障注入实测）。
+- 会话目录：`%TEMP%\mklinktool-<guid>\`（job.json / state.json / engine.log / robocopy.log）。中断恢复记录：`%LOCALAPPDATA%\mklinktool\pending\<会话名>.json`，迁移前写入，全部成功后删除，启动时按文件系统实际状态复查。
 - 安全模型：管道名含 128 位 GUID；GUI 校验 client PID、Worker 校验 server PID；管道 ACL 授予当前用户 + `BUILTIN\Administrators`（后者是为了"另一个管理员账号"OTS 提权场景）。
-- UI 与引擎之间唯一的进度通道是 `state.json`（引擎 tmp+Replace 原子写，UI 每 500ms 轮询）。
+- UI 与引擎之间唯一的进度通道是 `state.json`（引擎 tmp+Replace 原子写，UI 每 500ms 轮询）。每项结果带 `Index`（job.json 中的顺序），GUI 按序号匹配，不按路径文本匹配。作业的 `Status` 只存状态码，显示时由 `Convert-StatusText` 转中文。
 
 ## 文件编码规则（重要）
 
@@ -33,7 +34,8 @@
 ## Windows PowerShell 5.1 / .NET Framework 陷阱
 
 **长路径（>260 字符）**：
-- `[IO.Path]::GetFullPath`、`GetDirectoryName` 会抛 `PathTooLongException`；`GetPathRoot`/`GetFileName` 是纯字符串操作，安全。
+- `[IO.Path]::GetFullPath`、`GetDirectoryName` 会抛 `PathTooLongException`；`GetPathRoot`/`GetFileName` 是纯字符串操作，安全。**仅在系统未启用 `LongPathsEnabled` 时如此**（Windows 默认未启用）；当前开发机启用了它，长路径不抛异常，相关分支在本机测试中不会被触发。
+- `GetFullPath` 本身会展开 8.3 短名，末段不存在时也会展开已存在的前缀（实测 `C:\PROGRA~1\nonexistent\sub` → `C:\Program Files\nonexistent\sub`）；只有 `PathTooLongException` 分支需要手工 `GetLongPathNameW`。
 - 设备路径（`\\?\C:\...`、UNC 用 `\\?\UNC\`）跳过长度检查，且 .NET Fx 对其原样返回不做归并——`\\?\` 路径必须用反斜杠。
 - PS 5.1 cmdlet（`Get-Item`/`Rename-Item`/`New-Item`/`Get-ChildItem`）不支持长路径；用 .NET + `\\?\` 替代：改名用 `[IO.Directory]::Move`，枚举用 `[IO.Directory]::EnumerateFileSystemEntries`。
 - robocopy 自身支持长路径，保持传普通路径（不要加 `\\?\`）。
@@ -42,12 +44,15 @@
 
 **符号链接**：
 - PS 5.1 的 `New-Item -ItemType SymbolicLink` 走旧 API，需要 `SeCreateSymbolicLinkPrivilege`，且不支持长路径。用 P/Invoke `CreateSymbolicLinkW`：先传 flags 3（DIRECTORY 1 | ALLOW_UNPRIVILEGED_CREATE 2，开发者模式无需特权），错误码 87（旧系统不认识 flag 2）再回退 flags 1。
-- **必须在建链后验证路径真实存在**：某些安全策略会让 flags 1 "返回 TRUE 但什么都没创建"。
+- **`CreateSymbolicLinkW` 返回 1 字节的 `BOOLEAN`，声明必须加 `[return: MarshalAs(UnmanagedType.I1)]`**。按默认 4 字节 BOOL 封送会读入 EAX 高位残值：实测非提权 flags=1 失败时原始返回值为 `0x00000500`，被读成 TRUE。早先记录的"某些安全策略让 flags 1 返回 TRUE 但什么都没创建"就是这个封送错误，并非策略或沙箱所致。建链后的存在性验证仍保留作纵深防御。
+- 声明 P/Invoke 前先查返回类型：返回 `BOOLEAN`（1 字节）的 API 都要按 I1 封送；返回 `BOOL`（4 字节）的，如 `CreateHardLinkW`、`GetNamedPipeClientProcessId`，用默认 `bool` 即可。
 - 预检探针必须与真实建链用同一 API 与参数，否则产生假阴性/假阳性。
 - `LinkType`/`Target` 是 PowerShell 扩展类型数据（不是 .NET Fx 原生属性），但**直接 `[System.IO.DirectoryInfo]::new()` 的实例同样可用**，且 `Target` 返回的是去掉 `\\?\` 前缀的形态。
 
 **文件系统**：
-- `[IO.Directory]::Delete($path, $true)` 遇只读文件抛 `UnauthorizedAccessException`——先清 `ReadOnly` 属性再删。
+- `[IO.Directory]::Delete($path, $true)` 遇只读文件抛 `UnauthorizedAccessException`；只读目录、只读 Junction/符号链接连单体 `Directory.Delete` 都会被拒绝——删除前对根、目录、链接、文件统一清 `ReadOnly`（desktop.ini 自定义图标的文件夹就是只读目录）。
+- 对链接调用 `[IO.File]::SetAttributes` 改的是链接本身，不影响链接目标（已实测），清只读不会改动目标数据。
+- .NET Framework 的递归删除遇错**会继续删除其余条目**，最后才抛出第一个异常：失败时目录往往已接近删空，提示文案不能写"备份仍保留"。`Remove-TreeSafely` 用 `[ref]$ModificationStarted` 区分"未作改动"与"可能已部分删除"。
 - 计算哈希/校验时用 `FileShare::ReadWrite`，`FileShare::Read` 会因其他进程持有写句柄而炸。
 - `GetFileSystemInfos()` 按名称通配匹配会把 `[` 当通配符；需要精确匹配时全量枚举后自行比较。
 - PS 5.1 `Set-Content -PassThru` 返回的是字符串不是 FileInfo（写测试脚本时容易踩）。
@@ -57,19 +62,35 @@
 - DataGridView 开双缓冲需反射：`GetProperty('DoubleBuffered', 'Instance,NonPublic').SetValue($grid, $true, $null)`。
 - 若表格行与外部列表严格按序 1:1 对应，必须把所有列设 `SortMode='NotSortable'`，否则用户点表头排序即错位。
 - 就地刷新时 `ErrorText`/`ToolTipText` 要无条件赋值（含空串），否则旧错误残留。
-- 命名管道 ACL：OTS 提权 Worker 的用户 SID 与主窗口不同，但其令牌组含已启用的 `BUILTIN\Administrators`（SID `S-1-5-32-544`，用 SecurityIdentifier 构造避免本地化名称问题）。杀提权进程树用 `taskkill /PID <pid> /T /F`，普通 `Process.Kill()` 会留下孤儿引擎。
+- `CellEndEdit` 在进入编辑后未改动、甚至按 Esc 取消时也会触发（已实测）：处理程序必须先比较新旧值。
+- `CellMouseDown` 的 `e.X/e.Y` 相对于单元格；弹出菜单用 `ContextMenuStrip.Show([Cursor]::Position)`。
+- 运行期间不要 `$grid.Enabled = $false`（禁用后无法滚动、看不到下方行的进度与错误）；只锁可编辑列，并在 DragEnter 中显式拒绝拖放。
+- 命名管道 ACL：OTS 提权 Worker 的用户 SID 与主窗口不同，但其令牌组含已启用的 `BUILTIN\Administrators`（SID `S-1-5-32-544`，用 SecurityIdentifier 构造避免本地化名称问题）。
+- **非提权的 GUI 按完整性级别无法终止任何提权进程**（同一账户 UAC 提权的也不行）：`taskkill /T /F` 与 `Process.Kill()` 都会被拒绝。不要把"结束 Worker/引擎"当作清理手段；并发安全由引擎互斥锁保证。
+
+**PowerShell 语言细节**：
+- 中文弯引号 `“ ”` 在 PowerShell 中等同于双引号：写在双引号字符串里会提前截断字符串（解析报 Unexpected token）。含弯引号的文本用单引号字符串，配合 `-f` 格式化。
+- 逗号运算符优先级高于 `+`：`@($a, '\\?\' + $b)` 会被解析成三个元素，要写成 `@($a, ('\\?\' + $b))`。
+- 调用 .NET 方法时，PowerShell 会把 `$null` 转成空串传给 `string` 参数（实测 `[IO.File]::Replace($a, $b, $null)` 抛"路径格式非法"）；要传真正的 null 用 `[System.Management.Automation.Language.NullString]::Value`。
+- `Join-Path` 会解析 PowerShell 驱动器：基路径是不存在的盘符（如 `Q:\`）时直接抛 `DriveNotFoundException`。处理用户输入的路径时用字符串拼接或 `[IO.Path]::Combine`。
+- `-band` 等位运算的优先级低于比较运算：一律写成 `(($x -band $flag) -ne 0)`。
 
 ## 工具链与测试心得
 
-- **沙箱会扭曲文件系统语义**：本次实测沙箱内 `CreateSymbolicLinkW(flags 3)` 被拒（err 87）、flags 1 假成功；涉及符号链接/特权的测试必须脱离沙箱跑，且用真实文件系统状态（而非仅 API 返回值）做断言。
+- 涉及符号链接/特权的测试要用真实文件系统状态（而非仅 API 返回值）做断言。早先记录的"沙箱内 flags 1 假成功"实为 P/Invoke 封送错误（见"符号链接"一节）。
 - 复杂 PowerShell 测试一律写成 `.ps1` 文件用 `powershell.exe -File` 执行；内联 `-Command` 的多层引号转义几乎必炸。
+- 含中文的测试脚本同样必须存成 UTF-8 带 BOM，否则 PS 5.1 按 GBK 解码，中文注释可能吞掉换行、破坏代码。通过 Bash heredoc 生成文件时 `\\` 会被吞成 `\`（`\\?\` 前缀被破坏），这类内容改用文件写入工具或 PowerShell 写出。
 - **测试必须跑在产品目标运行时上**：Windows PowerShell 5.1（powershell.exe）与 PowerShell 7（pwsh）在编码默认值、长路径、API 表面上行为不同；本项目目标是 PS 5.1。
-- 验证套件覆盖（可复跑）：Worker 会话校验两分支、长路径/8.3/`..` 防绕过、写锁文件哈希、端到端 Analyze+Migrate（嵌套 Junction + 8.3 目标 + 只读文件 + SHA-256 + >260 来源）、强制失败的回滚链路（RolledBack + Errors 可见 + 源目录完整恢复）、GUI 启动冒烟。
-- 回滚链路的确定性测试方法：把引擎副本中的建链调用替换为 `throw` 后以 Migrate 运行——能完整覆盖"备份已改名→回滚改名→状态与错误记录"路径，无需真实制造提权失败。
+- 非提权运行引擎做端到端测试时（开发者模式下顶层建链可成功），Robocopy `/SL` 无法创建**嵌套符号链接**（需要 `SeCreateSymbolicLinkPrivilege`），复制校验会报"嵌套链接数不一致"。嵌套链接用 Junction 测，嵌套符号链接需提权测试。
+- 仓库中**没有**入库的测试文件。2026-10-14 一轮的验证脚本（引擎端到端 + 故障注入 48 项、GUI 函数与界面冒烟 43 项）的方法如下，需要时按此重建：
+  - 引擎：复制一份引擎，用"正则匹配唯一一行并替换为 `throw`"的方式注入故障，再以 `-File` 运行。覆盖矩阵：建链失败（回滚 + 后续项 NotStarted）、提交点后异常（不得回滚）、备份删除中途失败 + 警告日志写入失败（不得回滚）、删除前枚举失败（提示"完整保留"）。
+  - 引擎辅助函数：用 `[Parser]::ParseFile` 取 AST，把 `Add-Type` 与所需函数的 `Extent.Text` 点调用进测试会话。
+  - GUI：把 GUI 脚本副本末尾的 `[void]$form.ShowDialog()` 替换为点调用测试主体（在 GUI 作用域内运行），窗体移到屏幕外 `Show()`，伪造 state.json / engine.log / result 文件后调用 `Update-WorkerView`。注意：点调用脚本里的 `exit` 退出码传不出 `-File` 进程，按输出摘要判断成败；会弹 MessageBox 的函数需在测试主体里重定义为桩。
 - 修改三个脚本后最低限度回归：`[System.Management.Automation.Language.Parser]::ParseFile()` 三个文件 0 语法错误 + 文件头 BOM 检查。
 
 ## 已知边界
 
 - 引擎仅支持顶层 SymbolicLink（Junction 只作为来源内部的嵌套链接由 robocopy 保留）。
 - 相对路径、盘符根目录在预检/添加阶段即被明确拒绝。
-- GUI 非提权时无法强杀另一管理员账号的提权 Worker（taskkill 会失败并提示等待其自行退出）。
+- 非提权 GUI 无法终止任何提权 Worker/引擎（taskkill 会失败并提示等待其自行退出）；请求已发出但确认丢失时界面会解锁（计划中的 F5，尚未修复），引擎互斥锁保证不会出现第二个并发的迁移引擎。
+- 工具不复制源目录 ACL，目标副本继承目标位置权限；预检只提示、不阻断。
