@@ -6,24 +6,17 @@
 # -Mode Elevated：gui\WorkerTests.Body.ps1，仓库里原样的 Worker 经 UAC 提权启动，需要有人点一次“是”。
 param([ValidateSet('Fake', 'RealWorker', 'Elevated')][string]$Mode = 'Fake')
 $ErrorActionPreference = 'Stop'
+. (Join-Path $PSScriptRoot 'TestHelpers.ps1')
 $repoRoot = Split-Path -Parent $PSScriptRoot
 $guiPath = Join-Path $repoRoot 'migrate-local-folders.ps1'
 $workDir = Join-Path ([System.IO.Path]::GetTempPath()) ('mkl-gui-tests-' + [guid]::NewGuid().ToString('N'))
 [void][System.IO.Directory]::CreateDirectory($workDir)
 $utf8Bom = New-Object System.Text.UTF8Encoding($true)
 
-function Set-UniqueText([string]$Text, [string]$Old, [string]$New) {
-    $count = ([regex]::Matches($Text, [regex]::Escape($Old))).Count
-    if ($count -ne 1) { throw "Expected exactly one '$Old', found $count." }
-    return $Text.Replace($Old, $New)
-}
-
-function ConvertTo-Literal([string]$Value) {
-    return "'" + $Value.Replace("'", "''") + "'"
-}
-
 try {
     $text = [System.IO.File]::ReadAllText($guiPath, [System.Text.Encoding]::UTF8)
+    # 启动阶段的 trap 会弹出对话框：测试主体之外的异常一旦弹框，测试就会一直等人点击。副本里改为输出到控制台。
+    $text = Set-UniqueText $text '[void][System.Windows.Forms.MessageBox]::Show($startupError, ''mklinktool'', ''OK'', ''Error'')' '[Console]::Out.WriteLine($startupError)'
     switch ($Mode) {
         'Fake' {
             $prelude = ''

@@ -57,6 +57,14 @@ function Get-LinkType([string]$Path) {
     return [string][System.IO.DirectoryInfo]::new($Path).LinkType
 }
 
+function New-InjectedWorker([string]$Name, [string]$Anchor, [string]$Replacement) {
+    # 在 Worker 副本中把唯一匹配的一行替换为测试代码，另存到同一目录（Worker 按自身所在目录找引擎）。
+    $text = Set-UniqueText ([System.IO.File]::ReadAllText($script:TestWorkerPath, [System.Text.Encoding]::UTF8)) $Anchor $Replacement
+    $path = Join-Path (Split-Path -Parent $script:TestWorkerPath) ("migration-worker-$Name.ps1")
+    [System.IO.File]::WriteAllText($path, $text, (New-Object System.Text.UTF8Encoding($true)))
+    return $path
+}
+
 try {
     "  mode: $(if ($elevated) { 'elevated worker via UAC' } else { 'unelevated worker copy, no UAC' })"
     # A：含 Junction；提权模式再加绝对、相对两种目录符号链接（非提权的 Robocopy 复制不了嵌套符号链接）。
@@ -104,6 +112,8 @@ try {
     Assert (Wait-TaskEnd 180000) 'migration finished'
     Assert ($jobA.Status -eq 'Complete') 'A complete' "$($jobA.Status) $($jobA.Error)"
     Assert ((Get-LinkType $sourceA) -eq 'SymbolicLink' -and -not [System.IO.Directory]::Exists($sourceA + '_migration_backup')) 'A is now a symbolic link, backup deleted'
+    # 只记录、不断言：引擎新建的目标目录与文件归谁所有（提权模式下即提权进程新建的对象）。
+    "  INFO owner of the migrated target: $((Get-Acl -LiteralPath $targetA).Owner); of a file in it: $((Get-Acl -LiteralPath (Join-Path $targetA 'a.txt')).Owner)"
     Assert ((Get-LinkType (Join-Path $targetA 'jn')) -eq 'Junction' -and [System.IO.File]::ReadAllText((Join-Path $sourceA 'jn\b.txt')) -eq 'BBBBBBB') 'nested junction preserved and reachable through the new link'
     if ($elevated) {
         Assert ((Get-LinkType (Join-Path $targetA 'abs')) -eq 'SymbolicLink' -and (Get-LinkType (Join-Path $targetA 'links\rel')) -eq 'SymbolicLink') 'nested symbolic links preserved in the target'
@@ -144,6 +154,45 @@ try {
     Assert (@([System.IO.Directory]::GetFiles($sessionD, 'result-*.json')).Count -eq 1) 'worker wrote the result although its reply could not be sent'
     Assert ($script:PlanValid -and $script:Jobs[0].Status -eq 'Ready' -and -not $statusLabel.Text.Contains('没有返回')) 'completed with the real outcome' $statusLabel.Text
     Assert ($script:Worker.WaitForExit(10000) -and $script:Worker.HasExited -eq $true) 'worker exits afterwards; its exit is visible through the launch handle'
+
+    if ($elevated) {
+        '  SKIP [X6]-[X8]: they run a modified worker copy, which would need another UAC confirmation'
+    } else {
+        '[X6] The engine cannot be started while the main window waits for the reply: rejected as before'
+        # 像启动引擎很慢、随后失败那样先等 1.5 秒：X7 中主窗口只等 1 毫秒，必然先超时；立即失败的回复可能抢在超时之前到达。
+        $script:WorkerPath = New-InjectedWorker 'start-failure' '$engineProcess = Start-Process -FilePath $powershellPath -ArgumentList $arguments -PassThru -WindowStyle Hidden' "Start-Sleep -Milliseconds 1500; throw 'injected engine start failure'"
+        Close-ElevatedWorker
+        $before = Get-SessionDirs
+        $thrown = ''
+        try { Start-Worker 'Analyze' @($script:Jobs) (Get-WorkerConfig) } catch { $thrown = $_.Exception.Message }
+        $after = Get-SessionDirs
+        Assert ($thrown.Contains('injected engine start failure') -and -not $script:ActiveJob) 'rejection carries the worker error' $thrown
+        Assert (@($after | Where-Object { $before -notcontains $_ }).Count -eq 0) 'session directory removed, together with the result written before the reply'
+        Assert ($null -ne $script:WorkerPipe -and $script:WorkerPipe.IsConnected) 'worker stays connected for the next request'
+
+        '[X7] Same failure after a lost confirmation: the worker leaves a result with the reason, then exits'
+        $script:WorkerReadTimeoutMs = 1
+        $thrown = ''
+        try { Start-Worker 'Analyze' @($script:Jobs) (Get-WorkerConfig) } catch { $thrown = $_.Exception.Message }
+        $script:WorkerReadTimeoutMs = 30000
+        Assert ([string]::IsNullOrEmpty($thrown) -and $script:ActiveJob) 'tracking started' "$thrown | $($statusLabel.Text)"
+        $sessionX7 = $script:WorkerSessionPath
+        $workerX7 = $script:Worker
+        Assert (Wait-TaskEnd 60000) 'tracking finished'
+        $resultFiles = @([System.IO.Directory]::GetFiles($sessionX7, 'result-*.json'))
+        $resultX7 = if ($resultFiles.Count -eq 1) { [System.IO.File]::ReadAllText($resultFiles[0], [System.Text.Encoding]::UTF8) | ConvertFrom-Json } else { $null }
+        Assert ($null -ne $resultX7 -and $null -eq $resultX7.ExitCode -and $null -eq $resultX7.EnginePid -and ([string]$resultX7.ErrorMessage).Contains('injected engine start failure')) 'result file carries the reason, no engine' "files=$($resultFiles.Count)"
+        Assert ($statusLabel.Text.Contains('未能执行本次任务') -and $statusLabel.Text.Contains('injected engine start failure') -and -not $script:PlanValid) 'status shows the real reason instead of a missing result' $statusLabel.Text
+        Assert ($workerX7.WaitForExit(10000)) 'worker exits after its reply fails'
+
+        '[X8] The first rename of the result file fails: retried, the task ends with its real outcome'
+        $script:WorkerPath = New-InjectedWorker 'move-retry' '[System.IO.File]::Move($temporaryPath, $ResultPath)' ("if (-not (Test-Path variable:script:InjectedMoveFailure)) { `$script:InjectedMoveFailure = `$true; throw [System.IO.IOException]::new('injected sharing violation') }; " + '[System.IO.File]::Move($temporaryPath, $ResultPath)')
+        Close-ElevatedWorker
+        Start-Worker 'Analyze' @($script:Jobs) (Get-WorkerConfig)
+        Assert (Wait-TaskEnd 60000) 'analysis finished'
+        Assert ($script:PlanValid -and $script:Jobs[0].Status -eq 'Ready' -and -not $statusLabel.Text.Contains('Worker')) 'completed normally after the retry' $statusLabel.Text
+        $script:WorkerPath = $script:TestWorkerPath
+    }
 } catch {
     "TEST BODY ERROR: $($_.Exception.Message) at line $($_.InvocationInfo.ScriptLineNumber)"
     $script:TestFail++

@@ -20,14 +20,12 @@ function New-Case([string]$Name) {
 function New-EngineCopy([string]$CaseDir, [string]$Anchor, [string]$Injection, [ValidateSet('Before', 'After', 'Replace', 'None')][string]$Mode) {
     $text = $engineText
     if ($Mode -ne 'None') {
-        $count = ([regex]::Matches($text, [regex]::Escape($Anchor))).Count
-        if ($count -ne 1) { throw "Anchor must match exactly once, found $count : $Anchor" }
         $replacement = switch ($Mode) {
             'Before' { $Injection + "`n" + $Anchor }
             'After' { $Anchor + "`n" + $Injection }
             'Replace' { $Injection }
         }
-        $text = $text.Replace($Anchor, $replacement)
+        $text = Set-UniqueText $text $Anchor $replacement
     }
     $path = Join-Path $CaseDir 'engine.ps1'
     [System.IO.File]::WriteAllText($path, $text, $utf8Bom)
@@ -59,8 +57,10 @@ function New-SourceTree([string]$Root) {
     }
 }
 
-function Invoke-Engine([string]$CaseDir, [string]$Action, [object[]]$Jobs, [bool]$DeleteBackup = $true, [string]$Anchor = '', [string]$Injection = '', [string]$Mode = 'None') {
+function Invoke-Engine([string]$CaseDir, [string]$Action, [object[]]$Jobs, [bool]$DeleteBackup = $true, [string]$Anchor = '', [string]$Injection = '', [string]$Mode = 'None', [switch]$KeepSourcePermissions) {
     $config = [pscustomobject]@{ LinkType = 'SymbolicLink'; VerifySha256 = $false; DeleteBackup = $DeleteBackup; Jobs = @($Jobs) }
+    # 只在需要时才加这一项：其余用例的 job.json 没有它，顺带验证引擎能处理旧格式。
+    if ($KeepSourcePermissions) { $config | Add-Member -NotePropertyName KeepSourcePermissions -NotePropertyValue $true }
     [System.IO.File]::WriteAllText((Join-Path $CaseDir 'job.json'), ($config | ConvertTo-Json -Depth 5), $utf8NoBom)
     $engine = New-EngineCopy $CaseDir $Anchor $Injection $Mode
     & powershell.exe -NoProfile -ExecutionPolicy Bypass -File $engine -Action $Action -ConfigPath (Join-Path $CaseDir 'job.json') -StatePath (Join-Path $CaseDir 'state.json') -LogPath (Join-Path $CaseDir 'engine.log') -RobocopyLogPath (Join-Path $CaseDir 'robocopy.log') | Out-Null
@@ -97,6 +97,24 @@ function Test-NormalDirectory([string]$Path) {
 function New-TextFile([string]$Path, [string]$Text) {
     [void][System.IO.Directory]::CreateDirectory((Split-Path -Parent $Path))
     [System.IO.File]::WriteAllText($Path, $Text, $utf8NoBom)
+}
+
+function Get-AccessRuleSet([string]$Path) {
+    # 访问规则的集合（不看是否继承而来），用于比较两处的权限是否一致。
+    $security = if ([System.IO.Directory]::Exists($Path)) { [System.IO.Directory]::GetAccessControl($Path) } else { [System.IO.File]::GetAccessControl($Path) }
+    $rules = foreach ($rule in $security.GetAccessRules($true, $true, [System.Security.Principal.SecurityIdentifier])) {
+        '{0}|{1}|{2}|{3}|{4}' -f $rule.IdentityReference.Value, [int]$rule.FileSystemRights, $rule.InheritanceFlags, $rule.PropagationFlags, $rule.AccessControlType
+    }
+    return (@($rules | Sort-Object) -join ';')
+}
+
+function Get-UncPathForLocal([string]$Path) {
+    # 经本机 Users 共享访问 %TEMP% 下的路径；没有这个共享时返回空串。
+    $usersRoot = Join-Path $env:SystemDrive 'Users'
+    if (-not $Path.StartsWith($usersRoot + '\', [System.StringComparison]::OrdinalIgnoreCase)) { return '' }
+    $unc = '\\localhost\Users' + $Path.Substring($usersRoot.Length)
+    try { if ([System.IO.Directory]::Exists($unc)) { return $unc } } catch { }
+    return ''
 }
 
 # 下面的注入代码在引擎的 Invoke-Migration 作用域内运行，可直接使用 $source、$backup。
@@ -269,6 +287,65 @@ try {
         if ($held) { $mutex.ReleaseMutex() }
         $mutex.Dispose()
     }
+
+    '[E17] Sources on a network location are refused at preflight, including a local-looking path through a link to a share'
+    $caseDir = New-Case 'e17'
+    $localSource = Join-Path $caseDir 'src\local'
+    New-SourceTree $localSource
+    New-TextFile (Join-Path $caseDir 'real\viaLink\data.txt') 'data'
+    $caseUnc = Get-UncPathForLocal $caseDir
+    if ([string]::IsNullOrEmpty($caseUnc)) {
+        '  SKIP no \\localhost\Users share reaching the test directory'
+    } else {
+        $jobs = @(
+            [pscustomobject]@{ Source = (Join-Path $caseUnc 'src\local'); Target = (Join-Path $caseDir 'dst\unc') },
+            [pscustomobject]@{ Source = $localSource; Target = (Join-Path $caseDir 'dst\local') })
+        # 目录符号链接指向共享：路径看起来在本机，GetVolumePathName 也会报告本机磁盘（已实测）。
+        $null = & cmd.exe /c mklink /D (Join-Path $caseDir 'share-link') (Join-Path $caseUnc 'real')
+        $linkedSource = Join-Path $caseDir 'share-link\viaLink'
+        $haveLink = [System.IO.Directory]::Exists($linkedSource)
+        if ($haveLink) { $jobs += [pscustomobject]@{ Source = $linkedSource; Target = (Join-Path $caseDir 'dst\linked') } } else { '  SKIP (link part) could not reach the share through a directory symbolic link' }
+        $r = Invoke-Engine $caseDir 'Analyze' $jobs
+        $items = @($r.State.Jobs)
+        Assert ($r.ExitCode -eq 1 -and $items[0].Status -eq 'Error' -and $items[0].Error.Contains('网络位置')) 'UNC source refused' "exit=$($r.ExitCode) status=$($items[0].Status) error=$($items[0].Error)"
+        Assert ($items[1].Status -eq 'Ready') 'local source in the same batch still passes' "$($items[1].Status) $($items[1].Error)"
+        if ($haveLink) { Assert ($items[2].Status -eq 'Error' -and $items[2].Error.Contains('网络位置')) 'source reached through a link to a share refused' "$($items[2].Status) $($items[2].Error)" }
+        Assert ([System.IO.File]::Exists((Join-Path $caseDir 'real\viaLink\data.txt'))) 'nothing touched'
+    }
+
+    '[E18] Volumes that cannot hold the link are refused before anything is copied (volume info injected: all local volumes here are NTFS)'
+    $volumeAnchor = '$volume = Get-DirectoryVolumeInfo $parent'
+    $r = Invoke-EngineCase 'e18a' -Anchor $volumeAnchor -Injection "`$volume = [pscustomobject]@{ IsRemote = `$false; FileSystem = 'FAT32'; Flags = [uint32]6 }" -Mode After
+    $job = @($r.State.Jobs)[0]
+    Assert ($r.ExitCode -eq 1 -and [string]$r.State.Phase -eq 'PreflightFailed' -and $job.Error.Contains('FAT32') -and $job.Error.Contains('不支持符号链接')) 'FAT32 refused with the reason' "exit=$($r.ExitCode) phase=$($r.State.Phase) error=$($job.Error)"
+    Assert ((Test-NormalDirectory $r.Jobs[0].Source) -and -not [System.IO.Directory]::Exists($r.Jobs[0].Target)) 'Migrate stopped before copying'
+    $r = Invoke-EngineCase 'e18b' -Action 'Analyze' -Anchor $volumeAnchor -Injection "`$volume = [pscustomobject]@{ IsRemote = `$false; FileSystem = 'NTFS'; Flags = [uint32]0x80080 }" -Mode After
+    $job = @($r.State.Jobs)[0]
+    Assert ($r.ExitCode -eq 1 -and $job.Status -eq 'Error' -and $job.Error.Contains('只读')) 'read-only volume refused' "exit=$($r.ExitCode) error=$($job.Error)"
+
+    '[E19] KeepSourcePermissions: the target root takes the source root permissions instead of the target location'
+    $caseDir = New-Case 'e19'
+    $broadParent = Join-Path $caseDir 'dst'
+    [void][System.IO.Directory]::CreateDirectory($broadParent)
+    # 模拟非系统盘根下的目标位置：Users 获得可继承的修改权限（来源所在的 %TEMP% 没有这一条）。
+    $null = & icacls.exe $broadParent /grant '*S-1-5-32-545:(OI)(CI)M'
+    $keptSource = Join-Path $caseDir 'src\kept'
+    $plainSource = Join-Path $caseDir 'src\plain'
+    New-SourceTree $keptSource
+    New-SourceTree $plainSource
+    $sourceRootRules = Get-AccessRuleSet $keptSource
+    $sourceFileRules = Get-AccessRuleSet (Join-Path $keptSource 'a.txt')
+    $keptTarget = Join-Path $broadParent 'kept'
+    $r = Invoke-Engine $caseDir 'Migrate' @([pscustomobject]@{ Source = $keptSource; Target = $keptTarget }) -KeepSourcePermissions
+    $job = @($r.State.Jobs)[0]
+    Assert ($r.ExitCode -eq 0 -and $job.Status -eq 'Complete') 'migration with the option succeeds' "exit=$($r.ExitCode) status=$($job.Status) error=$($job.Error)"
+    $targetRootSecurity = [System.IO.Directory]::GetAccessControl($keptTarget)
+    Assert ($targetRootSecurity.AreAccessRulesProtected -and (Get-AccessRuleSet $keptTarget) -eq $sourceRootRules) 'target root protected, same rules as the source root' "protected=$($targetRootSecurity.AreAccessRulesProtected)"
+    Assert (-not (Get-AccessRuleSet $keptTarget).Contains('S-1-5-32-545|')) 'broad entry of the target location not inherited'
+    $targetFileSecurity = [System.IO.File]::GetAccessControl((Join-Path $keptTarget 'a.txt'))
+    Assert (-not $targetFileSecurity.AreAccessRulesProtected -and (Get-AccessRuleSet (Join-Path $keptTarget 'a.txt')) -eq $sourceFileRules) 'copied file inherits normally and matches a file of the source'
+    $r = Invoke-Engine $caseDir 'Migrate' @([pscustomobject]@{ Source = $plainSource; Target = (Join-Path $broadParent 'plain') })
+    Assert ($r.ExitCode -eq 0 -and (Get-AccessRuleSet (Join-Path $broadParent 'plain')).Contains('S-1-5-32-545|')) 'without the option the target inherits the target location as before' "exit=$($r.ExitCode)"
 } catch {
     "TEST ERROR: $($_.Exception.Message) at line $($_.InvocationInfo.ScriptLineNumber)"
     $script:TestFail++

@@ -11,6 +11,18 @@ function Write-TestSummary {
     "SUMMARY pass=$($script:TestPass) fail=$($script:TestFail)"
 }
 
+function Set-UniqueText([string]$Text, [string]$Old, [string]$New) {
+    # 给脚本副本注入测试代码：$Old 必须恰好出现一次，防止产品代码改动后注入点悄悄落空或落错位置。
+    $count = ([regex]::Matches($Text, [regex]::Escape($Old))).Count
+    if ($count -ne 1) { throw "Expected exactly one '$Old', found $count." }
+    return $Text.Replace($Old, $New)
+}
+
+function ConvertTo-Literal([string]$Value) {
+    # 生成 PowerShell 单引号字符串字面量。
+    return "'" + $Value.Replace("'", "''") + "'"
+}
+
 function Remove-TestTree([string]$Path) {
     # 删除测试目录：先拆除所有重解析点本身，再清只读属性，最后递归删除，不会穿过链接触及其目标。
     if ([string]::IsNullOrEmpty($Path) -or -not [System.IO.Directory]::Exists($Path)) { return }

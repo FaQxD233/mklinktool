@@ -4,9 +4,10 @@
 
 ## 项目架构速览
 
-- `migrate-local-folders.ps1`：GUI（WinForms，STA，非提权）。命名管道服务端，轮询 `state.json` 刷新界面。启动时检查工具目录权限（可被其他账户修改则红色警告）与中断恢复记录。请求已发出却没收到 Worker 的任务确认（超时、断开、回复无法解析）时进入**跟踪模式**：断开管道、保留 Worker 进程对象，界面保持锁定，凭结果文件、Worker 与引擎进程是否还在判断任务何时结束。
-- `migration-worker.ps1`：经 UAC 启动的提权 Worker。校验父进程 PID 后连接命名管道，按 `Execute{RequestId, Action, SessionPath, SessionTempRoot}` 拉起引擎子进程，结束后写 `result-<RequestId>.json`。Action 白名单：Analyze / Migrate / Cleanup / Restore。主窗口等不到确认就会断开管道（但 Worker 仍能读到断开前已写入管道的请求，2026-10-16 实测），所以"已接受"回复发送失败时 Worker 仍须等引擎结束、写出结果文件后再退出，否则主窗口只能报告"没有返回结果"。
-- `migration-engine.ps1`：Analyze（预检）、Migrate（robocopy 复制 + 校验 + 源目录改名备份 + 建顶层 SymbolicLink + 删除备份）、Cleanup（删除改名前失败或已回滚遗留的目标副本）、Restore（把中断迁移的备份改回原路径）。后三者持有 `Global\mklinktool-engine` 互斥锁。
+- `migrate-local-folders.cmd`：启动器，必须是纯 ASCII。脚本路径经环境变量 `MKLINKTOOL_GUI_SCRIPT` 交给 `powershell -Command "try { & $env:... } catch { MessageBox }"`：路径里的任何字符都不会被当作代码解析；脚本根本无法运行（语法错误、组策略强制的执行策略）时由这个 catch 弹框（只能写英文）。改用 `-File` 会让这些错误只打印到被隐藏的控制台。
+- `migrate-local-folders.ps1`：GUI（WinForms，STA，非提权）。命名管道服务端，轮询 `state.json` 刷新界面。首行之后的脚本级 `trap` 弹框显示启动阶段（窗口出现前）的异常；它不拦截窗口显示后事件处理程序中的异常（那些仍由 WinForms 的异常对话框处理，2026-10-17 实测）。启动时检查工具目录权限（可被其他账户修改则红色警告，并给出修复命令）与中断恢复记录。请求已发出却没收到 Worker 的任务确认（超时、断开、回复无法解析）时进入**跟踪模式**：断开管道、保留 Worker 进程对象，界面保持锁定，凭结果文件、Worker 与引擎进程是否还在判断任务何时结束。
+- `migration-worker.ps1`：经 UAC 启动的提权 Worker。校验父进程 PID 后连接命名管道，按 `Execute{RequestId, Action, SessionPath, SessionTempRoot}` 拉起引擎子进程，结束后写 `result-<RequestId>.json`。Action 白名单：Analyze / Migrate / Cleanup / Restore。主窗口等不到确认就会断开管道（但 Worker 仍能读到断开前已写入管道的请求，2026-10-16 实测），所以"已接受"回复发送失败时 Worker 仍须等引擎结束、写出结果文件后再退出，否则主窗口只能报告"没有返回结果"。同理，会话目录与请求编号校验通过之后、启动引擎之前的失败，也先写一份结果（`ExitCode` 与 `EnginePid` 为 null，附 `ErrorMessage`）再回复 `Error`；主窗口收到回复会删除会话目录，结果在回复之前就已写完，不存在竞争。结果统一经 `Write-RequestResult` 写出（临时文件 + 改名，拒绝重解析点，IO 错误有限重试）。
+- `migration-engine.ps1`：Analyze（预检，含来源所在卷能否承载链接的检查 `Assert-SourceVolumeCanHoldLink`）、Migrate（robocopy 复制 + 校验 + 源目录改名备份 + 建顶层 SymbolicLink + 删除备份；job.json 带 `KeepSourcePermissions` 时先由 `New-TargetRootWithSourceAccess` 按来源根目录的权限创建目标根目录）、Cleanup（删除改名前失败或已回滚遗留的目标副本）、Restore（把中断迁移的备份改回原路径）。后三者持有 `Global\mklinktool-engine` 互斥锁。
 - **提交点**：Migrate 中链接建立并验证通过、且改名后的备份与复制校验时的来源快照一致（路径、大小、修改时间、嵌套链接）后即视为提交（`$jobSucceeded`）；复核发现差异说明来源在校验后仍被写入，按建链失败回滚。提交点之后的任何异常只能记警告、不得回滚——回滚会删掉正在工作的链接，若备份已被部分删除还会把残缺目录改回原路径（2026-10-14 故障注入实测）。
 - 会话目录：`%TEMP%\mklinktool-<guid>\`（job.json / state.json / engine.log / robocopy.log / result-*.json），每个任务一个。主窗口显示时由 `Remove-StaleSessionDirectories` 删除超过 7 天（`$script:SessionRetentionDays`）的会话：只删名称严格匹配、只含普通文件、本身不是链接的目录，按其中最晚的修改时间计算。中断恢复记录：`%LOCALAPPDATA%\mklinktool\pending\<会话名>.json`，迁移前写入，全部成功后删除，启动时按文件系统实际状态复查。
 - 安全模型：管道名含 128 位 GUID；GUI 校验 client PID、Worker 校验 server PID；管道 ACL 授予当前用户 + `BUILTIN\Administrators`（后者是为了"另一个管理员账号"OTS 提权场景）。
@@ -22,7 +23,7 @@
 | 文件类型 | 编码 | 原因 |
 |---|---|---|
 | `.ps1` | UTF-8 **带 BOM** | PS 5.1 尊重 BOM 正确解码中文；PowerShell 7 默认 UTF-8；grep/diff/常见工具链友好。UTF-16LE 虽然也能被 PS 5.1 识别，但会让文本工具看到 NUL 字节、体积翻倍（2026-10 的编码损坏事故即因此难以排查）。 |
-| `.cmd` / `.bat` | 纯 ASCII | cmd 无法解析 UTF-16；UTF-8 BOM 在部分 cmd 版本会破坏首行 `@echo off`。 |
+| `.cmd` / `.bat` | 纯 ASCII | cmd 无法解析 UTF-16；UTF-8 BOM 在部分 cmd 版本会破坏首行 `@echo off`。因此启动器里的兜底提示与注释只能写英文。 |
 | 数据文件（job.json / state.json / engine.log） | UTF-8 无 BOM，**读写两侧都必须显式指定编码** | GUI 写入用 `UTF8Encoding($false)`；引擎/ GUI 读取必须带 `-Encoding UTF8` 或 `Encoding.UTF8`，否则 PS 5.1 默认按 ANSI 解码。 |
 | robocopy.log | **绝不预写** | 由 `/UNILOG+` 独占创建/追加，编码随 robocopy 版本而定（新版本实测为单字节/UTF-8，旧版本为 UTF-16 LE）。预写其他编码会造成编码混合。引擎带 `/NFL /NDL` 运行 robocopy：日志只有出错项与汇总，实测出错行仍带完整路径与原因。 |
 
@@ -61,6 +62,19 @@
 - `GetFileSystemInfos()` 按名称通配匹配会把 `[` 当通配符；需要精确匹配时全量枚举后自行比较。
 - PS 5.1 `Set-Content -PassThru` 返回的是字符串不是 FileInfo（写测试脚本时容易踩）。
 
+**卷与网络位置**（2026-10-17 实测）：
+- 判断一个目录实际在哪个卷，要打开它的句柄（`CreateFileW` + `FILE_FLAG_BACKUP_SEMANTICS`，会跟随路径中的挂载文件夹、Junction 与符号链接）再查询。按路径判断会漏判：C: 上指向网络共享的目录符号链接，`GetVolumePathNameW` 返回 `C:\`、`GetDriveType` 报固定磁盘（指向另一本地卷的 Junction 它倒能正确解析）。
+- 经 SMB 访问的目录，`GetVolumeInformationByHandleW` 报告的是服务器端的文件系统（NTFS）和标志（含 `FILE_SUPPORTS_REPARSE_POINTS`），只看文件系统标志拦不住网络共享。是否远程要看 `NtQueryVolumeInformationFile(FileFsDeviceInformation)` 的 `FILE_REMOTE_DEVICE`（0x10），这也是 `GetDriveType` 内部的依据；本机卷与经本机共享回环访问的同一目录，结果分别为 0x20020 与 0x10。
+- 本机的 `\\localhost\Users` 共享可用来在测试中得到网络路径（引擎用例 [E17]），不需要提权，也不改动系统设置。
+
+**访问控制（ACL）**（2026-10-17 实测）：
+- Robocopy `/COPY:S` 把来源的规则原样带到目标：规则仍标记为“继承”，DACL 却未受保护，而目标的父目录里并没有这些规则；一旦父目录重新传播继承，它们就会被父目录的规则取代。要让目标根目录保持来源权限，应先按来源根目录的规则创建受保护的目标根目录，再用 `/COPY:DAT` 复制（`New-TargetRootWithSourceAccess`）。
+- `FileSystemAccessRule` 的构造函数拒绝通用权限位：仅供继承的 ACE 常带 `GENERIC_ALL`（268435456）等，逐条重建规则会抛 `ArgumentOutOfRangeException`。复制 DACL 应改写 `RawSecurityDescriptor` 中原始 ACE 的标志；实测 ACE 的顺序（包括不规范的顺序）原样保留。
+- `AceFlags` 以 byte 为底层类型：`$ace.AceFlags -band (-bnot [AceFlags]::Inherited)` 报“指定的转换无效”，要先转 int：`[AceFlags]([int]$ace.AceFlags -band (-bnot [int][AceFlags]::Inherited))`。
+- `[IO.Directory]::CreateDirectory($path, $security)` 创建的 DACL 缺少“自动继承”（SE_DACL_AUTO_INHERITED）标志：其中新建的文件会按旧式继承得到受保护的显式副本，以后在根目录上改权限不会传播下去。创建后再用同一描述符 `SetAccessControl` 一次即可补上（`D:P` 变为 `D:PAI`），之后新建的文件与来源中新建的文件得到的规则完全一致。
+- `icacls` 遇到本机无法解析的 SID（例如沙箱工具添加的条目），在 `/remove`、`/grant` 中会报错 1332，且**整条命令都不生效**（“Successfully processed 0 files”）。要把权限整个换掉，用 PowerShell 新建 `DirectorySecurity`（`SetAccessRuleProtection($true, $false)` 后只加需要的规则）再 `Set-Acl`，对任何 SID 都有效，子项随之继承。
+- PowerShell 7 中 `DirectoryInfo` 没有 `GetAccessControl()` 实例方法（.NET Core 改成了扩展方法），PS 5.1 有；在 PS 7 里查看权限用 `Get-Acl`。Claude Code 的 PowerShell 工具运行的是 PowerShell 7，实测代码一律用 `powershell.exe -File` 跑在 5.1 上。
+
 **GUI（WinForms）**：
 - `RowHeadersVisible=$false` 时行级 `ErrorText` 图标不可见，错误提示必须挂在单元格（如 Status 列）上。
 - DataGridView 开双缓冲需反射：`GetProperty('DoubleBuffered', 'Instance,NonPublic').SetValue($grid, $true, $null)`。
@@ -72,6 +86,7 @@
 - 命名管道 ACL：OTS 提权 Worker 的用户 SID 与主窗口不同，但其令牌组含已启用的 `BUILTIN\Administrators`（SID `S-1-5-32-544`，用 SecurityIdentifier 构造避免本地化名称问题）。
 - **非提权的 GUI 按完整性级别无法终止任何提权进程**（同一账户 UAC 提权的也不行）：`taskkill /T /F` 与 `Process.Kill()` 都会被拒绝。不要把"结束 Worker/引擎"当作清理手段；并发安全由引擎互斥锁保证。`Stop-WorkerProcess` 只用于空闲或尚未接手任务的 Worker，且不带 `/T`。
 - 判断提权引擎是否还在：`Get-Process -Id`（只列出仍在运行的进程，即使别处还持有句柄）+ 进程名 + 启动时间，必要时 `WaitForExit(0)`（只需 SYNCHRONIZE）。**不要读 `HasExited`**：.NET Framework 为它申请 `PROCESS_QUERY_INFORMATION`，会被完整性级别拒绝；而 PowerShell 又会把这个异常吞成 `$null`（见下一节），判断结果全凭碰巧。判断不了时按“仍在运行”处理。
+- 用 UI Automation 读取 MessageBox 的正文时不要按 `ControlType.Text` 筛选：实测正文是类名为 `Static` 的控件，被报告为 `Pane`。取全部后代的 `Name` 拼起来即可（`tests\Test-Startup.ps1`）。
 
 **PowerShell 语言细节**：
 - 中文弯引号 `“ ”` 在 PowerShell 中等同于双引号：写在双引号字符串里会提前截断字符串（解析报 Unexpected token）。含弯引号的文本用单引号字符串，配合 `-f` 格式化。
@@ -80,6 +95,8 @@
 - `Join-Path` 会解析 PowerShell 驱动器：基路径是不存在的盘符（如 `Q:\`）时直接抛 `DriveNotFoundException`。处理用户输入的路径时用字符串拼接或 `[IO.Path]::Combine`。
 - `-band` 等位运算的优先级低于比较运算：一律写成 `(($x -band $flag) -ne 0)`。
 - **属性 getter 抛出的异常会被静默吞掉**：表达式里的 `$obj.Prop` 若 getter 抛异常，结果是 `$null`，既进不了 `catch`，也不记入 `$Error`（PS 5.1 实测，`Set-StrictMode -Version 2.0` 下相同）。所以 `try { $p.HasExited } catch {}` 永远捕获不到“拒绝访问”，`-not $p.HasExited` 反而得到 `$true`。需要拿到异常时调用方法形式 `$obj.get_Prop()`，或换用本身就是方法的 API。
+- 脚本级 `trap` 只处理脚本主体（及其调用的函数）抛出的异常；WinForms 事件处理程序中的异常不经过它，仍交给 `Application.ThreadException`（2026-10-17 实测）。`trap` 里 `exit` 只结束脚本：经 `& 脚本` 调用时回到调用方，不会再触发调用方的 catch。
+- 用 `-Command` 运行脚本时，把路径放进环境变量再 `& $env:X`，路径中的空格、单引号等都不会被解析成代码（实测）；`$PSScriptRoot`、`$PSCommandPath` 与 `-File` 时相同。脚本的语法错误、执行策略拦截在 `& $env:X` 处以 `ParseException`、`PSSecurityException` 抛出，能被 `try/catch` 捕获；`-File` 下它们只打印到控制台。
 
 ## 工具链与测试心得
 
@@ -88,15 +105,17 @@
 - 含中文的测试脚本同样必须存成 UTF-8 带 BOM，否则 PS 5.1 按 GBK 解码，中文注释可能吞掉换行、破坏代码。典型症状是不报语法错误，注释下一行的语句却像没执行一样（变量为 `$null`）。文件写入工具通常写出无 BOM 的 UTF-8，写完记得转换。通过 Bash heredoc 生成文件时 `\\` 会被吞成 `\`（`\\?\` 前缀被破坏），这类内容改用文件写入工具或 PowerShell 写出。
 - **测试必须跑在产品目标运行时上**：Windows PowerShell 5.1（powershell.exe）与 PowerShell 7（pwsh）在编码默认值、长路径、API 表面上行为不同；本项目目标是 PS 5.1。
 - 非提权运行引擎做端到端测试时（开发者模式下顶层建链可成功），Robocopy `/SL` 无法创建**嵌套符号链接**（需要 `SeCreateSymbolicLinkPrivilege`），复制校验会报"嵌套链接数不一致"。嵌套链接用 Junction 测，嵌套符号链接需提权测试。
-- **测试在 `tests/` 中**（2026-10-16 入库）：`powershell.exe -NoProfile -ExecutionPolicy Bypass -File tests\Invoke-AllTests.ps1` 依次运行 `Test-Static.ps1`（所有 `.ps1` 语法与 BOM、`.cmd` 纯 ASCII）、`Test-Engine.ps1`（引擎端到端与故障注入）、`Test-Gui.ps1`（假 Worker）与 `Test-Gui.ps1 -Mode RealWorker`（真实 Worker 与引擎以普通权限运行），按各自的 `SUMMARY pass= fail=` 行汇总，有失败时退出码为 1，约 50 秒。加 `-IncludeElevated` 再跑 `Test-Gui.ps1 -Mode Elevated`：仓库里原样的 Worker 经 UAC 提权，需要有人点一次“是”。发起请求的进程不在前台时，UAC 提示可能不直接切到安全桌面，只在任务栏闪烁，要点开才出现；约 2 分钟无人响应会自动取消，测试随即失败、不做任何改动。共用函数在 `TestHelpers.ps1`（断言、摘要、安全删除测试目录）与 `gui\GuiHarness.ps1`。需要开发者模式（或管理员身份）与桌面会话；只在 `%TEMP%` 下的临时目录里工作并自行清理。改动三个脚本后都应跑一遍；新增行为同时补用例。实现方法如下：
-  - 引擎：复制一份引擎，用"正则匹配唯一一行并插入或替换为测试代码"的方式注入故障，再以 `-File` 运行。覆盖：正常迁移（删除/保留备份）、N5 的三个写入时机、建链失败回滚与后续项 NotStarted、提交点后异常不回滚、备份删除中途失败与删除前枚举失败的提示、跨任务冲突写回各行、Cleanup（不跟随链接、三种拒绝情形）、Restore、引擎互斥锁。
+- **测试在 `tests/` 中**（2026-10-16 入库）：`powershell.exe -NoProfile -ExecutionPolicy Bypass -File tests\Invoke-AllTests.ps1` 依次运行 `Test-Static.ps1`（所有 `.ps1` 语法与 BOM、`.cmd` 纯 ASCII）、`Test-Engine.ps1`（引擎端到端与故障注入）、`Test-Gui.ps1`（假 Worker）、`Test-Gui.ps1 -Mode RealWorker`（真实 Worker 与引擎以普通权限运行）与 `Test-Startup.ps1`（经启动器副本启动，检查启动失败提示），按各自的 `SUMMARY pass= fail=` 行汇总，有失败时退出码为 1，约 70 秒（2026-10-17：186 项）。加 `-IncludeElevated` 再跑 `Test-Gui.ps1 -Mode Elevated`：仓库里原样的 Worker 经 UAC 提权，需要有人点一次“是”。发起请求的进程不在前台时，UAC 提示可能不直接切到安全桌面，只在任务栏闪烁，要点开才出现；约 2 分钟无人响应会自动取消，测试随即失败、不做任何改动。共用函数在 `TestHelpers.ps1`（断言、摘要、安全删除测试目录、在脚本副本中替换唯一匹配文本的 `Set-UniqueText`、`ConvertTo-Literal`）与 `gui\GuiHarness.ps1`。需要开发者模式（或管理员身份）与桌面会话；只在 `%TEMP%` 下的临时目录里工作并自行清理。改动三个脚本后都应跑一遍；新增行为同时补用例。实现方法如下：
+  - 引擎：复制一份引擎，用"正则匹配唯一一行并插入或替换为测试代码"的方式注入故障，再以 `-File` 运行。覆盖：正常迁移（删除/保留备份）、N5 的三个写入时机、建链失败回滚与后续项 NotStarted、提交点后异常不回滚、备份删除中途失败与删除前枚举失败的提示、跨任务冲突写回各行、Cleanup（不跟随链接、三种拒绝情形）、Restore、引擎互斥锁、来源位于网络位置（经 `\\localhost\Users` 共享与指向它的目录符号链接；没有该共享时输出 SKIP）、不能承载链接的卷（本机都是 NTFS，注入卷信息模拟 FAT32 与只读卷）、目标沿用来源权限（勾选与不勾选各一次，比较规则集合）。
   - 引擎辅助函数：用 `[Parser]::ParseFile` 取 AST，把 `Add-Type` 与所需函数的 `Extent.Text` 点调用进测试会话。
   - GUI：把 GUI 脚本副本末尾的 `[void]$form.ShowDialog()` 替换为点调用测试主体（在 GUI 作用域内运行），窗体移到屏幕外 `Show()`，伪造 state.json / engine.log / result 文件后调用 `Update-WorkerView`。注意：点调用脚本里的 `exit` 退出码传不出 `-File` 进程，按输出摘要判断成败；会弹 MessageBox 的函数需在测试主体里重定义为桩。
   - 轮询时序：在测试主体里重定义 `Refresh-Grid`（它位于一次轮询的中间），第一次调用时写入最终 state.json 与结果文件，即可确定性地复现“结束发生在两步之间”。
   - Worker 协议与跟踪模式：把 `Connect-ElevatedWorker` 重定义为空函数，测试主体自建 `NamedPipeServerStream`，另起一个 PowerShell 进程扮演 Worker（读请求后按模式：正常接受 / 不回复但照样写结果 / 回复 Error / 直接退出 / 留下仍在运行的“引擎”后退出），把它的 `Process` 对象赋给 `$script:Worker`。`$script:RecoveryJournalRoot` 指到临时目录，避免写入真实的中断恢复记录。
   - 完整性级别的模拟：非提权测试里，用 `SetSecurityInfo` 给替身进程加拒绝 `PROCESS_QUERY_INFORMATION`（0x400）与 `SYNCHRONIZE`（0x100000）的 ACE，即可重现主窗口访问提权引擎时拿不到的权限。
   - 会话目录清理：测试主体先保存 `${function:Remove-StaleSessionDirectories}` 再把它换成桩（窗口显示时会调用它，不能让测试清理真实的 `%TEMP%`），然后对临时根目录调用保存的原函数。
-  - 真实 Worker（`gui\WorkerTests.Body.ps1`）：不桩 `Connect-ElevatedWorker`，走真实的管道、PID 校验、握手与引擎。普通权限模式由启动器复制一份去掉提权检查的 Worker（与引擎放在同一目录），并去掉 GUI 副本里的 `-Verb RunAs`；提权模式用仓库原样的 Worker，并把副本里等待连接的 30 秒放宽到 120 秒。让来源改名失败的做法：用 `FileShare.Read`（不含 Delete）打开来源里的一个文件，目录改名会报“访问被拒绝”，但文件仍能被 Robocopy 读取复制。模拟确认丢失：把 `$script:WorkerReadTimeoutMs` 设为 1。
+  - 真实 Worker（`gui\WorkerTests.Body.ps1`）：不桩 `Connect-ElevatedWorker`，走真实的管道、PID 校验、握手与引擎。普通权限模式由启动器复制一份去掉提权检查的 Worker（与引擎放在同一目录），并去掉 GUI 副本里的 `-Verb RunAs`；提权模式用仓库原样的 Worker，并把副本里等待连接的 30 秒放宽到 120 秒。让来源改名失败的做法：用 `FileShare.Read`（不含 Delete）打开来源里的一个文件，目录改名会报“访问被拒绝”，但文件仍能被 Robocopy 读取复制。模拟确认丢失：把 `$script:WorkerReadTimeoutMs` 设为 1。Worker 自身的故障（[X6]–[X8]）由测试主体把 Worker 副本注入后另存到同一目录、改指 `$script:WorkerPath` 再重连；只在普通权限模式下运行（提权模式下要再点一次 UAC）。注入的失败若立即发生，Worker 的回复可能抢在主窗口 1 毫秒的等待超时之前到达，跟踪模式就不会出现：注入代码先 `Start-Sleep` 1.5 秒（2026-10-17 实测踩到）。
+  - 启动失败提示（`Test-Startup.ps1`）：把启动器与 GUI 副本放进名称含空格和单引号的临时目录，经 `cmd /c` 运行启动器副本；启动器用 `start` 拉起的 PowerShell 是 cmd 的子进程，按父进程号找到它，等标题为 mklinktool 的窗口出现后用 UI Automation 读出正文，再 `CloseMainWindow()` 关闭并确认进程退出（若弹出第二个对话框，进程就不会退出）。这些对话框会在屏幕上短暂出现。
+  - GUI 测试的启动 trap：`Test-Gui.ps1` 在 GUI 副本中把 trap 里的 MessageBox 换成控制台输出，否则测试主体之外的异常会弹框、一直等人点击。
 - 修改三个脚本后最低限度回归：`tests\Test-Static.ps1`（语法 + BOM）；能跑全套时跑 `tests\Invoke-AllTests.ps1`。
 
 ## 已知边界
@@ -106,4 +125,7 @@
 - 非提权 GUI 无法终止任何提权 Worker/引擎（taskkill 会失败并提示等待其自行退出）；请求已发出但确认丢失时进入跟踪模式，等任务确实结束才解锁；引擎互斥锁保证不会出现第二个并发的迁移引擎。
 - 写入检测（N5）覆盖“复制后、校验快照前”与“校验后、提交前”两个窗口；检测不到的是：在改名后仍持有句柄（以 FILE_SHARE_DELETE 打开）的应用在复核之后的写入，以及修改时间推迟到句柄关闭才更新的同大小原地改写。
 - 目标卷为 FAT32 时不比较修改时间（以本地时间保存，跨夏令时会差整小时），exFAT 允许 2 秒误差，NTFS/ReFS 精确比较。
-- 工具不复制源目录 ACL，目标副本继承目标位置权限；预检只提示、不阻断。
+- 来源必须位于能承载符号链接的本机卷（支持重解析点、不是只读）；网络位置一律拒绝；可移动磁盘上的 NTFS 卷允许。
+- 默认不复制源目录 ACL，目标副本继承目标位置权限，预检只提示、不阻断；勾选“目标沿用来源的访问权限”时，目标根目录沿用来源根目录当前生效的权限，来源子项上单独设置的权限仍不复制。所有者在两种情况下都不保留：提权引擎新建的目标目录与文件，所有者是 `BUILTIN\Administrators` 而不是用户本人（2026-10-17 提权实测；非提权运行时是当前用户），迁移后的 Git 仓库可能因此报 “dubious ownership”。
+- 工具目录权限检查只警告并给出修复办法，不阻断：检查代码与被保护的脚本在同一目录，挡不住已经发生的篡改，真正的防线是安装位置。
+- 受约束语言模式（AppLocker/WDAC）下 Add-Type 与 WinForms 都不可用，启动失败时无法弹出提示。

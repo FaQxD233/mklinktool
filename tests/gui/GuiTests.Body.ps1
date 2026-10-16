@@ -19,6 +19,7 @@ Show-TestForm
 $utf8 = New-Object System.Text.UTF8Encoding($false)
 $createdSessions = New-Object System.Collections.Generic.List[string]
 $cleanupRoot = Join-Path ([System.IO.Path]::GetTempPath()) ('mkl-gui-tests-sessions-' + [guid]::NewGuid().ToString('N'))
+$permissionRoot = Join-Path ([System.IO.Path]::GetTempPath()) ('mkl-gui-tests-permissions-' + [guid]::NewGuid().ToString('N'))
 
 function Reset-TestJobs {
     $script:Jobs.Clear()
@@ -250,6 +251,54 @@ try {
     Assert ([System.IO.Directory]::Exists((Join-Path $withSubdirectory 'unexpected'))) 'session with unexpected content kept'
     Assert ([System.IO.File]::Exists((Join-Path $otherName 'file.ps1'))) 'non-session name kept'
     Assert ([System.IO.Directory]::Exists($linkedSession) -and [System.IO.File]::Exists((Join-Path $linkTargetDir 'precious.txt'))) 'junction named like a session kept, its target untouched'
+
+    '[G6] keep-source-permissions option: permission hints, plan validity and the engine config'
+    [void][System.IO.Directory]::CreateDirectory((Join-Path $permissionRoot 'src\P'))
+    [void][System.IO.Directory]::CreateDirectory((Join-Path $permissionRoot 'broad'))
+    # 目标位置给 Users 可继承的修改权限，来源（%TEMP% 下）没有：不勾选时应给出提示。
+    $null = & icacls.exe (Join-Path $permissionRoot 'broad') /grant '*S-1-5-32-545:(OI)(CI)M'
+    $script:Jobs.Clear()
+    [void]$script:Jobs.Add([pscustomobject]@{
+        Source = (Join-Path $permissionRoot 'src\P'); Target = (Join-Path $permissionRoot 'broad\P'); IsCustomTarget = $true
+        FileCount = 0; TotalBytes = 0L; JunctionCount = 0; SymbolicLinkCount = 0; AbsoluteLinkCount = 0
+        Status = 'Ready'; Warning = ''; PermissionWarning = ''; Error = ''; CleanupTarget = ''
+    })
+    Refresh-Grid
+    $keepPermissionsCheckbox.Checked = $false
+    Assert (-not (Get-WorkerConfig).KeepSourcePermissions) 'option off by default'
+    $script:PlanValid = $true
+    Assert ((Update-PermissionWarnings) -eq 1 -and $script:Jobs[0].PermissionWarning.Contains('目标沿用来源的访问权限')) 'unchecked: broad target location reported, hint names the option' $script:Jobs[0].PermissionWarning
+    $keepPermissionsCheckbox.Checked = $true
+    Assert ([string]::IsNullOrEmpty($script:Jobs[0].PermissionWarning) -and $statusLabel.Text.StartsWith('预检通过。')) 'checked: hint cleared at once' $statusLabel.Text
+    Assert ($script:PlanValid -and (Get-WorkerConfig).KeepSourcePermissions) 'plan still valid, option passed to the engine'
+    $keepPermissionsCheckbox.Checked = $false
+    Assert (-not [string]::IsNullOrEmpty($script:Jobs[0].PermissionWarning) -and $statusLabel.Text.Contains('1 项')) 'unchecked again: hint back' $statusLabel.Text
+    $script:PlanValid = $false
+
+    '[G7] the tool-directory warning carries a fix command, and running it clears the warning'
+    $toolDir = Join-Path $permissionRoot 'tool'
+    [void][System.IO.Directory]::CreateDirectory($toolDir)
+    $toolScript = Join-Path $toolDir 'migration-worker.ps1'
+    [System.IO.File]::WriteAllText($toolScript, '# stand-in', $utf8)
+    # 上级目录给 Users 可继承的修改权限；目录本身再加一条本机无法解析的 SID（像沙箱工具添加的那样）：icacls 处理不了这种条目。
+    $null = & icacls.exe $permissionRoot /grant '*S-1-5-32-545:(OI)(CI)M'
+    $unknownSid = 'S-1-5-21-1111111111-2222222222-3333333333-444444444'
+    $toolSecurity = [System.IO.Directory]::GetAccessControl($toolDir)
+    $toolSecurity.AddAccessRule((New-Object System.Security.AccessControl.FileSystemAccessRule((New-Object System.Security.Principal.SecurityIdentifier $unknownSid), 'Modify', 'ContainerInherit, ObjectInherit', 'None', 'Allow')))
+    [System.IO.Directory]::SetAccessControl($toolDir, $toolSecurity)
+    $warning = Get-ToolTamperWarning $toolDir @($toolScript)
+    Assert ($warning.Contains($unknownSid) -and $warning.Contains('C:\Program Files\mklinktool')) 'warning lists the unresolvable writer and the safe location' $warning
+    Assert ((Get-WritePrincipalSids (Get-PathSecurity $toolDir) $false) -contains 'S-1-5-32-545') 'inherited broad writer detected'
+    $fixLine = @($warning -split "`r?`n" | Where-Object { $_.StartsWith('$d = ') }) | Select-Object -First 1
+    Assert ($null -ne $fixLine -and $fixLine.Contains($toolDir)) 'warning contains a fix command for this directory'
+    if ($null -ne $fixLine) {
+        $encodedFix = [Convert]::ToBase64String([System.Text.Encoding]::Unicode.GetBytes($fixLine))
+        $fixOutput = & $powershellExe -NoProfile -EncodedCommand $encodedFix 2>&1 | Out-String
+        Assert ($LASTEXITCODE -eq 0) 'fix command runs' $fixOutput
+        Assert ([string]::IsNullOrEmpty((Get-ToolTamperWarning $toolDir @($toolScript)))) 'no warning after the fix (inherited and unresolvable entries removed)'
+        [System.IO.File]::AppendAllText($toolScript, "`r`n# still writable by the current user", $utf8)
+        Assert ([System.IO.File]::ReadAllText($toolScript).Contains('still writable')) 'the current user can still edit the scripts'
+    }
 } catch {
     "TEST BODY ERROR: $($_.Exception.Message) at line $($_.InvocationInfo.ScriptLineNumber)"
     $script:TestFail++
@@ -259,6 +308,7 @@ try {
     foreach ($dir in $createdSessions) { try { [System.IO.Directory]::Delete($dir, $true) } catch { } }
     try { if ([System.IO.Directory]::Exists($script:RecoveryJournalRoot)) { [System.IO.Directory]::Delete($script:RecoveryJournalRoot, $true) } } catch { }
     try { Remove-TestTree $cleanupRoot } catch { }
+    try { if ([System.IO.Directory]::Exists($permissionRoot)) { $null = & icacls.exe $permissionRoot /reset /T /Q; Remove-TestTree $permissionRoot } } catch { }
     $form.Close()
 }
 Write-TestSummary

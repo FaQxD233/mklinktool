@@ -1,10 +1,20 @@
 ﻿$ErrorActionPreference = 'Stop'
-
-Add-Type -AssemblyName System.Windows.Forms
-if ($PSVersionTable.PSVersion -lt [version]'5.1') {
-    Write-Error '需要 Windows PowerShell 5.1 或更高版本。'
+# 启动阶段（窗口显示之前）的未处理异常：启动器以隐藏窗口运行 PowerShell，不弹框提示就是“双击后没有任何反应”。
+# trap 只覆盖脚本主体，窗口显示后事件处理程序中的异常仍由 WinForms 的异常对话框处理（已实测）。
+# 脚本根本无法运行（语法错误、执行策略拦截）时走不到这里，由启动器 migrate-local-folders.cmd 兜底提示。
+trap {
+    $startupError = '目录迁移工具启动失败：' + [Environment]::NewLine + [Environment]::NewLine + $_.Exception.Message + [Environment]::NewLine + [Environment]::NewLine + $_.InvocationInfo.PositionMessage
+    try {
+        Add-Type -AssemblyName System.Windows.Forms
+        [void][System.Windows.Forms.MessageBox]::Show($startupError, 'mklinktool', 'OK', 'Error')
+    } catch {
+        [Console]::Error.WriteLine($startupError)
+    }
     exit 1
 }
+
+Add-Type -AssemblyName System.Windows.Forms
+if ($PSVersionTable.PSVersion -lt [version]'5.1') { throw '需要 Windows PowerShell 5.1 或更高版本。' }
 
 Add-Type -AssemblyName System.Drawing
 [System.Windows.Forms.Application]::EnableVisualStyles()
@@ -303,6 +313,7 @@ function Get-WorkerConfig {
         LinkType = 'SymbolicLink'
         VerifySha256 = [bool]$shaCheckbox.Checked
         DeleteBackup = [bool]$deleteBackupCheckbox.Checked
+        KeepSourcePermissions = [bool]$keepPermissionsCheckbox.Checked
         Jobs = $configJobs
     }
 }
@@ -339,16 +350,17 @@ function Get-PrincipalDisplayName([string]$Sid) {
     }
 }
 
-function Get-ToolTamperWarning {
+function Get-ToolTamperWarning([string]$ToolDirectory, [string[]]$ToolFiles) {
     # 提权 Worker 与引擎直接从本目录加载脚本。除当前用户、SYSTEM、Administrators、TrustedInstaller 外，
     # 任何账户或组能写入（或拥有）这些文件或目录，都能在下次提权时以管理员身份执行任意代码。
+    $currentUserSid = [System.Security.Principal.WindowsIdentity]::GetCurrent().User.Value
     $trustedSids = @(
-        [System.Security.Principal.WindowsIdentity]::GetCurrent().User.Value,
+        $currentUserSid,
         'S-1-5-18', 'S-1-5-32-544', 'S-1-3-4',
         'S-1-5-80-956008885-3418522649-1831038044-1853292631-2271478464'
     )
     $untrustedSids = New-Object 'System.Collections.Generic.List[string]'
-    foreach ($path in @($PSScriptRoot, $PSCommandPath, $script:WorkerPath, $script:EnginePath, (Join-Path $PSScriptRoot 'migrate-local-folders.cmd'))) {
+    foreach ($path in @($ToolDirectory) + @($ToolFiles)) {
         try {
             $security = Get-PathSecurity $path
             $sids = @(Get-WritePrincipalSids $security $false) + @($security.GetOwner([System.Security.Principal.SecurityIdentifier]).Value)
@@ -362,11 +374,26 @@ function Get-ToolTamperWarning {
     }
     if ($untrustedSids.Count -eq 0) { return '' }
     $names = @($untrustedSids | ForEach-Object { Get-PrincipalDisplayName $_ }) -join '、'
-    return "工具目录或其中的脚本可被以下账户或组修改：$names。`r`n这些脚本会以管理员身份运行，其他账户可借此在你下次提权时执行任意代码。`r`n建议把工具移到仅管理员可写的位置，例如 C:\Program Files\mklinktool。`r`n工具目录：$PSScriptRoot"
+    # 修复命令把目录权限整个换成三条（当前用户、Administrators、SYSTEM 完全控制，不继承上级目录），其中的文件随之继承。
+    # 不用 icacls：它遇到本机无法解析的 SID（例如沙箱工具添加的条目）会报错 1332，整条命令都不生效（已实测）。
+    $fixCommand = ('$d = ''{0}''; $s = New-Object System.Security.AccessControl.DirectorySecurity; $s.SetAccessRuleProtection($true, $false); ' +
+        'foreach ($id in ''{1}'', ''S-1-5-32-544'', ''S-1-5-18'') {{ $s.AddAccessRule((New-Object System.Security.AccessControl.FileSystemAccessRule(' +
+        '(New-Object System.Security.Principal.SecurityIdentifier $id), ''FullControl'', ''ContainerInherit, ObjectInherit'', ''None'', ''Allow''))) }}; ' +
+        'Set-Acl -LiteralPath $d -AclObject $s') -f $ToolDirectory.Replace("'", "''"), $currentUserSid
+    $newLine = [Environment]::NewLine
+    return ("工具目录或其中的脚本可被以下账户或组修改：$names。" + $newLine +
+        '这些脚本会以管理员身份运行，能修改它们的账户可借此在你下次提权时执行任意代码。这项检查本身也在这个目录里，挡不住已经发生的篡改，风险只能靠安装位置消除。' + $newLine + $newLine +
+        '修复办法（任选其一）：' + $newLine +
+        '1. 把工具移到只有管理员能写入的位置，例如 C:\Program Files\mklinktool。' + $newLine +
+        '2. 把当前目录的权限收紧为只有你、Administrators、SYSTEM 可写：在 PowerShell 中运行下面这一行（日志区中的文字可以选中复制）。目录所有者不是你时会提示拒绝访问，请改用第 1 种办法。' + $newLine +
+        $fixCommand + $newLine +
+        '之后若仍有提示，说明某个文件单独设置了权限，可对它运行 icacls "<文件路径>" /reset。' + $newLine + $newLine +
+        '收紧之前请先确认脚本没有被改过，例如重新下载，或在 Git 仓库中运行 git status。' + $newLine +
+        "工具目录：$ToolDirectory")
 }
 
 function Get-TargetPermissionWarning($Job) {
-    # 工具不复制源目录 ACL（Robocopy /COPY:DAT），目标副本会继承目标位置的权限。目标位置允许宽泛组写入、
+    # 不勾选“目标沿用来源的访问权限”时，目标副本继承目标位置的权限（Robocopy /COPY:DAT 不复制 ACL）。目标位置允许宽泛组写入、
     # 而来源目前不允许时，迁移会扩大能修改这些数据的账户范围；若是程序目录，其他账户还可借此替换会被提权运行的文件。
     try {
         $ancestor = [System.IO.Path]::GetDirectoryName((ConvertTo-UiDevicePath (ConvertTo-UiFullPath ([string]$Job.Target))))
@@ -380,7 +407,7 @@ function Get-TargetPermissionWarning($Job) {
         $addedWriters = @($targetWriters | Where-Object { $sourceWriters -notcontains $_ })
         if ($addedWriters.Count -eq 0) { return '' }
         $names = @($addedWriters | ForEach-Object { Get-PrincipalDisplayName $_ }) -join '、'
-        return "权限提示：目标位置会让 $names 获得写入权限（工具不复制源目录权限），而来源目前不允许；迁移后本机其他账户可修改这些数据。若这是程序目录，还可能被用来提权。"
+        return ('权限提示：目标位置会让 {0} 获得写入权限，而来源目前不允许；迁移后本机其他账户可修改这些数据。若这是程序目录，还可能被用来提权。勾选“目标沿用来源的访问权限”可避免。' -f $names)
     } catch {
         # 权限检查只是提示：读不到 ACL 时不阻断流程。
         return ''
@@ -388,9 +415,10 @@ function Get-TargetPermissionWarning($Job) {
 }
 
 function Update-PermissionWarnings {
+    # 勾选“目标沿用来源的访问权限”时，目标根目录不继承目标位置的权限，这项提示不适用。
     $warningCount = 0
     foreach ($job in $script:Jobs) {
-        $job.PermissionWarning = Get-TargetPermissionWarning $job
+        $job.PermissionWarning = if ($keepPermissionsCheckbox.Checked) { '' } else { Get-TargetPermissionWarning $job }
         if (-not [string]::IsNullOrEmpty($job.PermissionWarning)) {
             $warningCount++
             $logTextBox.AppendText("$($job.Source)：$($job.PermissionWarning)" + [Environment]::NewLine)
@@ -398,6 +426,12 @@ function Update-PermissionWarnings {
     }
     Refresh-Grid
     return $warningCount
+}
+
+function Get-PreflightPassedText([int]$PermissionWarningCount) {
+    # 含中文弯引号的文本只能用单引号字符串：PowerShell 把“”当作双引号，会截断双引号字符串。
+    if ($PermissionWarningCount -gt 0) { return '预检通过；其中 {0} 项的目标位置允许本机其他账户写入，悬停“状态”列可查看。' -f $PermissionWarningCount }
+    return '预检通过。检查目标路径后可以开始迁移。'
 }
 
 function Get-ProcessStartStamp([int]$ProcessId) {
@@ -704,6 +738,7 @@ function Set-WorkerBusy([bool]$Busy) {
     $structureCombo.Enabled = -not $Busy
     $shaCheckbox.Enabled = -not $Busy
     $deleteBackupCheckbox.Enabled = -not $Busy
+    $keepPermissionsCheckbox.Enabled = -not $Busy
     $startButton.Enabled = (-not $Busy) -and $script:PlanValid
     Update-CleanupButton
 }
@@ -747,9 +782,7 @@ function Complete-WorkerAction([int]$ExitCode, [string]$Message = '') {
         $startButton.Enabled = $script:PlanValid
         if ($script:PlanValid) {
             $script:LastAnalysisSignature = Get-CurrentSignature
-            $permissionWarningCount = Update-PermissionWarnings
-            # 含中文弯引号的文本只能用单引号字符串：PowerShell 把“”当作双引号，会截断双引号字符串。
-            $statusLabel.Text = if ($permissionWarningCount -gt 0) { '预检通过；其中 {0} 项的目标位置允许本机其他账户写入，悬停“状态”列可查看。' -f $permissionWarningCount } else { '预检通过。检查目标路径后可以开始迁移。' }
+            $statusLabel.Text = Get-PreflightPassedText (Update-PermissionWarnings)
         } else {
             $statusLabel.Text = '预检失败。请查看表格“状态”列的错误提示和日志。'
         }
@@ -1019,7 +1052,16 @@ function Get-WorkerCompletion {
             if ([int]$result.Version -eq 1 -and [string]$result.RequestId -eq $script:WorkerRequestId -and [string]$result.Action -eq $script:WorkerAction) {
                 # [int]$null 为 0，不能把缺失的退出码当成成功。
                 if ($null -eq $result.ExitCode) {
-                    return [pscustomobject]@{ ExitCode = $null; Message = '提权 Worker 没有取得引擎的退出码，任务结果未知；请核对日志与当前状态。' }
+                    # Worker 自身出错时会附上原因；结果中没有引擎 PID 说明引擎根本没有启动。
+                    $workerError = if ($null -ne $result.PSObject.Properties['ErrorMessage']) { [string]$result.ErrorMessage } else { '' }
+                    $message = if ([string]::IsNullOrWhiteSpace($workerError)) {
+                        '提权 Worker 没有取得引擎的退出码，任务结果未知；请核对日志与当前状态。'
+                    } elseif ($null -eq $result.EnginePid) {
+                        '提权 Worker 未能执行本次任务：' + $workerError
+                    } else {
+                        '提权 Worker 处理本次任务时出错：' + $workerError + '；任务结果未知，请核对日志与当前状态。'
+                    }
+                    return [pscustomobject]@{ ExitCode = $null; Message = $message }
                 }
                 return [pscustomobject]@{ ExitCode = [int]$result.ExitCode; Message = '' }
             }
@@ -1137,6 +1179,12 @@ $deleteBackupCheckbox.AutoSize = $true
 $deleteBackupCheckbox.Location = New-Object System.Drawing.Point(560, 100)
 $form.Controls.Add($deleteBackupCheckbox)
 
+$keepPermissionsCheckbox = New-Object System.Windows.Forms.CheckBox
+$keepPermissionsCheckbox.Text = '目标沿用来源的访问权限'
+$keepPermissionsCheckbox.AutoSize = $true
+$keepPermissionsCheckbox.Location = New-Object System.Drawing.Point(780, 100)
+$form.Controls.Add($keepPermissionsCheckbox)
+
 $analyzeButton = New-Object System.Windows.Forms.Button
 $analyzeButton.Text = '扫描并预检'
 $analyzeButton.Location = New-Object System.Drawing.Point(16, 136)
@@ -1239,11 +1287,14 @@ $interactionToolTip = New-Object System.Windows.Forms.ToolTip
 $interactionToolTip.SetToolTip($grid, 'Ctrl+单击或 Shift+单击可多选；右键来源或目标路径可打开菜单。')
 $interactionToolTip.SetToolTip($addButton, '添加一个或多个文件夹；也可以从资源管理器直接拖入窗口或列表。')
 $interactionToolTip.SetToolTip($cleanupButton, '删除迁移在改名前失败或已回滚后遗留的目标副本；只在来源仍完好保留在原位置时才会删除。')
+$interactionToolTip.SetToolTip($keepPermissionsCheckbox, ("勾选后，目标根目录沿用来源根目录当前生效的访问权限，不继承目标位置的权限，其中的内容从目标根目录继承：迁移不会让本机其他账户获得原本没有的权限。`r`n" +
+    "来源子项上单独设置的权限不会复制；来源权限不允许管理员写入的目录会复制失败（来源不受影响）；目标若是会接到其他电脑上的外接盘，那边的普通用户将无法直接打开。`r`n" +
+    '不勾选时目标继承目标位置的权限，预检会在目标位置更宽松时给出提示。'))
 
 # 启动时检查工具目录与脚本的写入权限：会被提权运行的脚本若可被其他账户修改，就构成提权执行面。
-$toolTamperWarning = Get-ToolTamperWarning
+$toolTamperWarning = Get-ToolTamperWarning $PSScriptRoot @($PSCommandPath, $script:WorkerPath, $script:EnginePath, (Join-Path $PSScriptRoot 'migrate-local-folders.cmd'))
 if (-not [string]::IsNullOrEmpty($toolTamperWarning)) {
-    $linkHintLabel.Text = '安全警告：工具目录可被其他账户修改，悬停查看详情。'
+    $linkHintLabel.Text = '安全警告：工具目录可被其他账户修改，悬停查看详情与修复办法。'
     $linkHintLabel.ForeColor = [System.Drawing.Color]::Firebrick
     $interactionToolTip.SetToolTip($linkHintLabel, $toolTamperWarning)
     $logTextBox.AppendText('安全警告：' + $toolTamperWarning + [Environment]::NewLine)
@@ -1319,6 +1370,12 @@ $browseRootButton.Add_Click({
 
 $rootTextBox.Add_TextChanged({ Update-GeneratedTargets '目标根目录已更改，请重新扫描并预检。' })
 $structureCombo.Add_SelectedIndexChanged({ Update-GeneratedTargets '目标结构已更改，请重新扫描并预检。' })
+$keepPermissionsCheckbox.Add_CheckedChanged({
+    # 这个选项不影响预检结论，不作废预检结果；预检已通过时随即更新各行的权限提示。
+    if ($script:PlanValid -and -not (Test-WorkerActive)) {
+        $statusLabel.Text = Get-PreflightPassedText (Update-PermissionWarnings)
+    }
+})
 
 $addButton.Add_Click({
     $folderDialog.Description = '选择要迁移的来源文件夹'
@@ -1433,7 +1490,11 @@ $startButton.Add_Click({
         }
     }
     $permissionWarningCount = @($script:Jobs | Where-Object { -not [string]::IsNullOrEmpty([string]$_.PermissionWarning) }).Count
-    $permissionNotice = if ($permissionWarningCount -gt 0) { "`r`n" + ('其中 {0} 项的目标位置允许本机其他账户写入（工具不复制源目录权限），详见“状态”列提示。' -f $permissionWarningCount) } else { '' }
+    $permissionNotice = if ($keepPermissionsCheckbox.Checked) {
+        "`r`n目标根目录沿用来源根目录当前生效的访问权限，不继承目标位置的权限。"
+    } elseif ($permissionWarningCount -gt 0) {
+        "`r`n" + ('其中 {0} 项的目标位置允许本机其他账户写入（目标不沿用来源权限），详见“状态”列提示。' -f $permissionWarningCount)
+    } else { '' }
     $summary = "即将处理 $($script:Jobs.Count) 个目录，总计约 $(Format-Bytes $totalBytes)。`r`n顶层链接类型：SymbolicLink。$nestedLinkNotice$permissionNotice`r`n$backupAction`r`n`r`n目标路径和源路径都将按当前表格内容处理。确认开始？"
     $answer = [System.Windows.Forms.MessageBox]::Show($summary, '确认迁移', 'YesNo', 'Warning')
     if ($answer -ne [System.Windows.Forms.DialogResult]::Yes) { return }

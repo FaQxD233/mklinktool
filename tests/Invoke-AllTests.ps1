@@ -1,7 +1,8 @@
-﻿# 运行全部测试：静态检查、引擎端到端与故障注入、GUI。
+﻿# 运行全部测试：静态检查、引擎端到端与故障注入、GUI、启动失败提示。
 # 用法：powershell.exe -NoProfile -ExecutionPolicy Bypass -File tests\Invoke-AllTests.ps1 [-IncludeElevated]
 # 要求：Windows PowerShell 5.1；开启开发者模式（或以管理员身份运行）以便非提权创建目录符号链接；有桌面会话（GUI 测试会在屏幕外创建窗口）。
 # 默认的 GUI 测试分两组：假 Worker；真实 Worker 与引擎以普通权限运行（不弹 UAC）。
+# 启动测试（Test-Startup.ps1）会在屏幕上短暂弹出真实的错误对话框，读出文字后随即自动关闭。
 # -IncludeElevated：再跑一组走真实 UAC 与提权 Worker 的端到端测试，运行时需要有人点一次 UAC 的“是”。
 # 测试只在 %TEMP% 下的临时目录中工作，结束时清理；不会改动真实的中断恢复记录或旧会话目录。
 param([switch]$IncludeElevated)
@@ -11,7 +12,8 @@ $suites = @(
     @{ Name = 'Test-Static.ps1'; Arguments = @() },
     @{ Name = 'Test-Engine.ps1'; Arguments = @() },
     @{ Name = 'Test-Gui.ps1'; Arguments = @() },
-    @{ Name = 'Test-Gui.ps1'; Arguments = @('-Mode', 'RealWorker') })
+    @{ Name = 'Test-Gui.ps1'; Arguments = @('-Mode', 'RealWorker') },
+    @{ Name = 'Test-Startup.ps1'; Arguments = @() })
 if ($IncludeElevated) { $suites += @{ Name = 'Test-Gui.ps1'; Arguments = @('-Mode', 'Elevated') } }
 $totalPass = 0
 $totalFail = 0

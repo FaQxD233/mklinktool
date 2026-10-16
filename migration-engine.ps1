@@ -21,13 +21,15 @@ Set-StrictMode -Version 2.0
 
 $script:Utf8NoBom = New-Object System.Text.UTF8Encoding($false)
 
-# Win32 API：长路径的 8.3 短名展开与目录符号链接创建。
+# Win32 API：长路径的 8.3 短名展开、目录符号链接创建，以及按句柄查询目录实际所在的卷。
 # CreateSymbolicLinkW 返回 1 字节的 BOOLEAN，必须按 I1 封送：按默认 4 字节 BOOL 读取会混入 EAX 高位残值，
 # 实测失败时返回值 0x00000500 被读成 TRUE（即曾被误认为“某些策略下返回 TRUE 但没有创建”）。
+# GetVolumeInformationByHandleW 返回 4 字节的 BOOL，按默认方式封送即可。
 Add-Type -TypeDefinition @'
 using System;
 using System.Runtime.InteropServices;
 using System.Text;
+using Microsoft.Win32.SafeHandles;
 public static class MklinkToolWin32 {
     [DllImport("kernel32.dll", CharSet = CharSet.Unicode, SetLastError = true)]
     public static extern uint GetLongPathNameW(string lpszShortPath, StringBuilder lpszLongPath, uint cchBuffer);
@@ -35,6 +37,21 @@ public static class MklinkToolWin32 {
     [DllImport("kernel32.dll", CharSet = CharSet.Unicode, SetLastError = true)]
     [return: MarshalAs(UnmanagedType.I1)]
     public static extern bool CreateSymbolicLinkW(string lpSymlinkFileName, string lpTargetFileName, uint dwFlags);
+
+    [DllImport("kernel32.dll", CharSet = CharSet.Unicode, SetLastError = true)]
+    public static extern SafeFileHandle CreateFileW(string lpFileName, uint dwDesiredAccess, uint dwShareMode, IntPtr lpSecurityAttributes, uint dwCreationDisposition, uint dwFlagsAndAttributes, IntPtr hTemplateFile);
+
+    [DllImport("kernel32.dll", CharSet = CharSet.Unicode, SetLastError = true)]
+    public static extern bool GetVolumeInformationByHandleW(SafeFileHandle hFile, StringBuilder lpVolumeNameBuffer, uint nVolumeNameSize, out uint lpVolumeSerialNumber, out uint lpMaximumComponentLength, out uint lpFileSystemFlags, StringBuilder lpFileSystemNameBuffer, uint nFileSystemNameSize);
+
+    [StructLayout(LayoutKind.Sequential)]
+    public struct IoStatusBlock { public IntPtr Status; public IntPtr Information; }
+
+    [StructLayout(LayoutKind.Sequential)]
+    public struct FileFsDeviceInformation { public uint DeviceType; public uint Characteristics; }
+
+    [DllImport("ntdll.dll")]
+    public static extern int NtQueryVolumeInformationFile(SafeFileHandle FileHandle, out IoStatusBlock IoStatusBlock, out FileFsDeviceInformation FsInformation, uint Length, int FsInformationClass);
 }
 '@
 $script:State = [ordered]@{
@@ -265,6 +282,89 @@ function Test-SymbolicLinkCreation {
             if ([System.IO.Directory]::Exists($probeRoot)) { [System.IO.Directory]::Delete($probeRoot, $true) }
         } catch { }
     }
+}
+
+function Get-DirectoryVolumeInfo([string]$ExtendedPath) {
+    # 按句柄查询目录实际所在的卷：CreateFile 会跟随路径中的挂载文件夹、Junction 与符号链接。按路径字符串或盘符判断会漏判，
+    # 实测 C: 上指向网络共享的目录符号链接，GetVolumePathName 仍报告 C:\（固定磁盘）。
+    # 0x80 = FILE_READ_ATTRIBUTES；7 = 读、写、删除全共享；3 = OPEN_EXISTING；0x02000000 = FILE_FLAG_BACKUP_SEMANTICS（打开目录必需）。
+    $displayPath = ConvertFrom-ExtendedLengthPath $ExtendedPath
+    $handle = [MklinkToolWin32]::CreateFileW($ExtendedPath, 0x80, 7, [IntPtr]::Zero, 3, 0x02000000, [IntPtr]::Zero)
+    if ($handle.IsInvalid) {
+        throw "无法确认来源所在的卷能否建立符号链接（打开目录失败，Win32 错误码 $([System.Runtime.InteropServices.Marshal]::GetLastWin32Error())）：$displayPath"
+    }
+    try {
+        $ioStatus = New-Object MklinkToolWin32+IoStatusBlock
+        $deviceInfo = New-Object MklinkToolWin32+FileFsDeviceInformation
+        # 4 = FileFsDeviceInformation；结构体共 8 字节。
+        $status = [MklinkToolWin32]::NtQueryVolumeInformationFile($handle, [ref]$ioStatus, [ref]$deviceInfo, 8, 4)
+        if ($status -ne 0) {
+            throw ('无法确认来源所在的卷能否建立符号链接（查询设备信息失败，NTSTATUS 0x{0:X8}）：{1}' -f $status, $displayPath)
+        }
+        $fileSystemName = New-Object System.Text.StringBuilder 261
+        [uint32]$serialNumber = 0
+        [uint32]$maximumComponentLength = 0
+        [uint32]$fileSystemFlags = 0
+        if (-not [MklinkToolWin32]::GetVolumeInformationByHandleW($handle, $null, 0, [ref]$serialNumber, [ref]$maximumComponentLength, [ref]$fileSystemFlags, $fileSystemName, 261)) {
+            throw "无法确认来源所在的卷能否建立符号链接（查询卷信息失败，Win32 错误码 $([System.Runtime.InteropServices.Marshal]::GetLastWin32Error())）：$displayPath"
+        }
+        return [pscustomobject]@{
+            # 0x10 = FILE_REMOTE_DEVICE：UNC 共享、映射的网络驱动器，以及经链接转到这些位置的路径。
+            IsRemote = (($deviceInfo.Characteristics -band 0x10) -ne 0)
+            FileSystem = $fileSystemName.ToString()
+            Flags = $fileSystemFlags
+        }
+    } finally {
+        $handle.Dispose()
+    }
+}
+
+function Assert-SourceVolumeCanHoldLink([string]$Source) {
+    # 顶层链接与改名备份都在来源的父目录里，要检查的是父目录实际所在的卷；否则 FAT32/exFAT、只读卷或网络位置
+    # 要等全量复制、校验、改名都完成，到建链一步才失败（随后回滚）。
+    $parent = [System.IO.Path]::GetDirectoryName((Get-ExtendedLengthPath $Source))
+    $volume = Get-DirectoryVolumeInfo $parent
+    if ($volume.IsRemote) {
+        # 链接会建在远程计算机上：远程计算机默认不解析指向本机的符号链接（SymlinkEvaluation 的 R2L 默认禁用）；
+        # 即使本机允许，其他访问该共享的计算机也会把链接解析到它们自己的磁盘。
+        throw "来源实际位于网络位置（UNC 共享、映射的网络驱动器，或路径中有指向网络的链接），只支持本机磁盘上的来源：$Source"
+    }
+    # 0x80 = FILE_SUPPORTS_REPARSE_POINTS（FAT32、exFAT、光盘等没有）；0x80000 = FILE_READ_ONLY_VOLUME。
+    if (($volume.Flags -band 0x80) -eq 0) {
+        throw "来源所在卷的文件系统（$($volume.FileSystem)）不支持符号链接，无法在原位置建立链接：$Source"
+    }
+    if (($volume.Flags -band 0x80000) -ne 0) {
+        throw "来源所在卷是只读的，无法改名备份并建立链接：$Source"
+    }
+}
+
+function New-TargetRootWithSourceAccess([string]$Source, [string]$Target) {
+    # 目标根目录沿用来源根目录当前生效的访问规则（继承来的一律转为显式），并且不继承目标父目录；副本内容随后从这里继承，
+    # 实测与来源中新建文件得到的规则完全一致。来源子项上单独设置的权限不复制。
+    # 不用 Robocopy /COPY:S：它把来源规则原样带过来，仍标记为“继承”且 DACL 不受保护，目标父目录一旦重新传播继承就会被替换（已实测）。
+    # 直接改写原始 ACE 的标志：逐条重建 FileSystemAccessRule 时，仅供继承的 ACE 里的通用权限位（如 GENERIC_ALL）超出枚举范围会抛异常（已实测）。
+    $accessSection = [System.Security.AccessControl.AccessControlSections]::Access
+    $sourceSecurity = [System.IO.Directory]::GetAccessControl((Get-ExtendedLengthPath $Source), $accessSection)
+    $descriptor = [System.Security.AccessControl.RawSecurityDescriptor]::new($sourceSecurity.GetSecurityDescriptorBinaryForm(), 0)
+    foreach ($ace in $descriptor.DiscretionaryAcl) {
+        # AceFlags 以 byte 为底层类型：先转成 int 再做位运算，否则 PowerShell 报“指定的转换无效”。
+        $ace.AceFlags = [System.Security.AccessControl.AceFlags]([int]$ace.AceFlags -band (-bnot [int][System.Security.AccessControl.AceFlags]::Inherited))
+    }
+    $descriptor.SetFlags($descriptor.ControlFlags -bor [System.Security.AccessControl.ControlFlags]::DiscretionaryAclProtected)
+    $binaryForm = New-Object byte[] $descriptor.BinaryLength
+    $descriptor.GetBinaryForm($binaryForm, 0)
+    $targetSecurity = New-Object System.Security.AccessControl.DirectorySecurity
+    $targetSecurity.SetSecurityDescriptorBinaryForm($binaryForm, $accessSection)
+
+    if (Test-PathEntryExists $Target) {
+        throw "目标路径已被创建，无法按来源权限创建目标根目录：$Target"
+    }
+    # 带安全描述符创建，目录从创建那一刻起就不带目标位置的宽泛权限。但这样创建的 DACL 缺少“自动继承”标志，
+    # 其中新建的文件会按旧式继承得到受保护的显式副本（不再标记为继承），以后在根目录上改权限不会传播下去（已实测）；
+    # 再按同一描述符设置一次即补上该标志。
+    $extendedTarget = Get-ExtendedLengthPath $Target
+    [void][System.IO.Directory]::CreateDirectory($extendedTarget, $targetSecurity)
+    [System.IO.Directory]::SetAccessControl($extendedTarget, $targetSecurity)
 }
 
 function Get-ContainedDirectoryLinkInfo($Entry, [string]$RootPath, [string]$AbsoluteLinkRoot, [bool]$RequireTargetExists = $true) {
@@ -544,6 +644,7 @@ function Get-MigrationAnalysis($Config) {
             if (-not [System.IO.Directory]::Exists((Get-ExtendedLengthPath $source))) {
                 throw "来源目录不存在：$source"
             }
+            Assert-SourceVolumeCanHoldLink $source
             if (Test-PathEntryExists $target) {
                 throw "目标路径已经存在：$target"
             }
@@ -787,6 +888,8 @@ function Remove-VerifiedLink([string]$Path, [string]$Target, [string]$LinkType) 
 }
 
 function Invoke-Migration($Config) {
+    # 旧格式的 job.json 没有这一项；StrictMode 下读取不存在的属性会抛异常。
+    $keepSourcePermissions = ($null -ne $Config.PSObject.Properties['KeepSourcePermissions']) -and [bool]$Config.KeepSourcePermissions
     $analysisResult = Get-MigrationAnalysis -Config $Config
     $jobs = @($analysisResult.Jobs)
     $script:State.Jobs = $jobs
@@ -816,6 +919,10 @@ function Invoke-Migration($Config) {
             $extendedTarget = Get-ExtendedLengthPath $target
             $targetParent = [System.IO.Path]::GetDirectoryName($extendedTarget)
             [void][System.IO.Directory]::CreateDirectory($targetParent)
+            if ($keepSourcePermissions) {
+                New-TargetRootWithSourceAccess -Source $source -Target $target
+                Write-Log "目标根目录沿用来源根目录当前生效的访问权限，不继承目标位置：$target"
+            }
 
             $robocopy = Join-Path $env:WINDIR 'System32\robocopy.exe'
             if (-not (Test-Path -LiteralPath $robocopy -PathType Leaf)) {
