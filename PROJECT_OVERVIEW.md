@@ -10,6 +10,11 @@
 | `migrate-local-folders.ps1` | GUI 主程序 | 提供 WinForms 窗口、目录选择/拖放、多选和右键操作、目标路径预览、预检、迁移与“清理失败副本”按钮；通过命名管道控制提权 Worker，并用 WinForms Timer 刷新任务状态。启动时检查工具目录权限和中断恢复记录。 |
 | `migration-worker.ps1` | 提权 Worker | 首次需要提权的操作时由主程序请求 UAC 启动；验证管理员令牌、命名管道对端 PID 和固定协议，在主窗口会话期间复用，并为 Analyze/Migrate/Cleanup/Restore 启动引擎子进程。 |
 | `migration-engine.ps1` | 迁移引擎 | 执行预检、磁盘空间检查、非穿透目录快照、Robocopy、文件/链接比较、来源备份改名、顶层符号链接创建、链接验证、回滚和备份清理；另提供清理失败遗留的目标副本、恢复中断迁移两个动作，改动类动作之间以全局互斥锁串行。 |
+| `tests\Invoke-AllTests.ps1` | 测试入口 | 依次运行静态检查、引擎测试与两组 GUI 测试并汇总结果，有失败时退出码为 1；`-IncludeElevated` 再加一组提权测试（需要点一次 UAC）。需要 Windows PowerShell 5.1、开发者模式（或管理员身份）和桌面会话。 |
+| `tests\TestHelpers.ps1` | 测试 | 各测试共用的断言、摘要与安全删除测试目录的函数。 |
+| `tests\Test-Static.ps1` | 测试 | 所有 `.ps1` 语法与 UTF-8 BOM、`.cmd` 纯 ASCII。 |
+| `tests\Test-Engine.ps1` | 测试 | 引擎端到端与故障注入：正常迁移、写入检测、回滚与提交点、备份删除失败提示、跨任务冲突、清理失败副本、中断恢复、互斥锁。 |
+| `tests\Test-Gui.ps1`、`tests\gui\` | 测试 | 把 GUI 脚本副本与测试主体组合后在屏幕外运行，三种模式：`Fake`（`GuiTests.Body.ps1` + `FakeWorker.ps1`：轮询时序、确认丢失跟踪、引擎存活判断、失败副本记录、旧会话目录清理）；`RealWorker`（`WorkerTests.Body.ps1`：真实 Worker 与引擎以普通权限跑预检、迁移、清理、恢复与确认丢失）；`Elevated`（同一主体，Worker 经真实 UAC 提权，另验证嵌套目录符号链接）。`GuiHarness.ps1` 是共用函数。 |
 | `README.md` | 用户文档 | 介绍安装前提、使用方式、目录布局、迁移与恢复流程及已知限制。 |
 | `DESIGN.md` | 架构文档 | 记录组件关系、Worker 管道信任边界、迁移状态流程和安全决策。 |
 | `PROJECT_OVERVIEW.md` | 项目索引/审查 | 当前文件职责、运行调用链、审查发现和覆盖范围。 |
@@ -20,7 +25,7 @@
 | `plan-nested-junction-support.md` | 链接支持设计记录 | 记录内部目录 Junction/SymbolicLink 的边界、快照、Robocopy 和清理设计；不是程序入口。 |
 | `PLAN_project_review_and_file_documentation.md` | 文档审查计划 | 记录早期文档审查范围、用户确认和验收约束；不参与程序运行。 |
 | `PLAN_bug_summary_and_fixes.md` | 第一轮问题清单（历史） | 2026-10-12 的问题总结与修复方案（F1–F15）；其中多项结论已被第二轮计划更正，以第二轮为准。 |
-| `PLAN_bug_review_round2.md` | 第二轮复核计划与执行记录 | 2026-10-13 复核结论（含实测记录、对上一轮结论的更正）、已确认的修复范围、2026-10-14 执行记录和 2026-10-15 第三轮检查与修复记录；未修复项的后续计划也在其中。 |
+| `PLAN_bug_review_round2.md` | 第二轮复核计划与执行记录 | 2026-10-13 复核结论（含实测记录、对上一轮结论的更正）、已确认的修复范围、2026-10-14 执行记录、2026-10-15 第三轮检查与修复记录，以及 2026-10-16 的临时目录清理与测试入库记录；未修复项的后续计划也在其中。 |
 | `.gitignore` | Git 配置 | 忽略本地启动日志 `migrate-local-folders-launch.log` 与本地 IDE 目录 `.trae/`。 |
 | `.gitattributes` | Git 配置 | 仓库内统一存 LF；`.ps1`、`.cmd` 检出为 CRLF。 |
 
@@ -69,7 +74,7 @@ flowchart LR
 
 ## 覆盖范围与限制
 
-- 仓库当前没有已跟踪的自动化测试文件，也没有 CI 测试工作流；历史计划中的临时验证记述不是可重复运行的测试套件。2026-10-14 与 2026-10-15 两轮验证的方法（故障注入、AST 抽取函数、GUI 屏幕外冒烟、假 Worker 进程、用进程 ACL 模拟完整性级别）记录在 `AGENTS.md`，测试入库列在第二轮计划的后续批次中。
+- 自动化测试在 `tests/`（2026-10-16 入库，`tests\Invoke-AllTests.ps1` 一次运行，约 50 秒），没有 CI 工作流。提权流程有半自动测试（`-IncludeElevated`，需要点一次 UAC），2026-10-16 在修复 F10 前后各运行一次，均全部通过。仍需人工验证的是：“以另一个管理员账号提权”（需要该账号的密码）、右键菜单弹出位置、启动时中断恢复提示的弹窗交互。测试方法（故障注入、GUI 屏幕外运行、假 Worker 进程、真实 Worker 的普通权限副本、用进程 ACL 模拟完整性级别）记录在 `AGENTS.md`。
 - 本次 `verify-security` 脚本扫描了 0 个源文件，因为它的规则不覆盖 `.ps1` 和 `.cmd`；因此不能将扫描结果解释为 PowerShell 代码通过安全扫描。Worker 的管道 ACL、双方 PID 校验、管理员令牌检查、固定消息类型和会话路径限制已作人工检查，但这不是正式渗透测试。
 - 本次审查是静态代码阅读；PowerShell 5.1 Parser 检查用于语法验证。未模拟交互式 UAC/Explorer 拖放，也未在真实来源目录或目标目录运行迁移。
 - 目标空间预检按来源字节数估算并额外保留 1 GB；SHA-256 默认关闭。用户应结合目标卷空间、文件重要性和迁移时间决定是否开启哈希校验及是否保留备份。

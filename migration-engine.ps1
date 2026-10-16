@@ -823,10 +823,12 @@ function Invoke-Migration($Config) {
             }
             # Robocopy 的输出已通过 /UNILOG+ 写入日志文件；临时关闭 Stop 偏好，
             # 避免 PS 5.1 把 stderr 输出升级为终止错误而丢失真实退出码。
+            # /NFL /NDL：不逐条记录正常复制的文件与目录，日志只剩出错项（实测仍带完整路径与原因）和汇总，
+            # 避免大目录的日志随文件数线性膨胀；复制是否完整由下面的快照比较负责。
             $previousErrorActionPreference = $ErrorActionPreference
             $ErrorActionPreference = 'Continue'
             try {
-                & $robocopy $source $target /E /COPY:DAT /DCOPY:DAT /SJ /SL /R:1 /W:1 /NP ("/UNILOG+:$RobocopyLogPath") 2>&1 | Out-Null
+                & $robocopy $source $target /E /COPY:DAT /DCOPY:DAT /SJ /SL /R:1 /W:1 /NP /NFL /NDL ("/UNILOG+:$RobocopyLogPath") 2>&1 | Out-Null
             } finally {
                 $ErrorActionPreference = $previousErrorActionPreference
             }

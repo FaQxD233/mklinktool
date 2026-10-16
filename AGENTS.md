@@ -5,10 +5,10 @@
 ## 项目架构速览
 
 - `migrate-local-folders.ps1`：GUI（WinForms，STA，非提权）。命名管道服务端，轮询 `state.json` 刷新界面。启动时检查工具目录权限（可被其他账户修改则红色警告）与中断恢复记录。请求已发出却没收到 Worker 的任务确认（超时、断开、回复无法解析）时进入**跟踪模式**：断开管道、保留 Worker 进程对象，界面保持锁定，凭结果文件、Worker 与引擎进程是否还在判断任务何时结束。
-- `migration-worker.ps1`：经 UAC 启动的提权 Worker。校验父进程 PID 后连接命名管道，按 `Execute{RequestId, Action, SessionPath, SessionTempRoot}` 拉起引擎子进程，结束后写 `result-<RequestId>.json`。Action 白名单：Analyze / Migrate / Cleanup / Restore。
+- `migration-worker.ps1`：经 UAC 启动的提权 Worker。校验父进程 PID 后连接命名管道，按 `Execute{RequestId, Action, SessionPath, SessionTempRoot}` 拉起引擎子进程，结束后写 `result-<RequestId>.json`。Action 白名单：Analyze / Migrate / Cleanup / Restore。主窗口等不到确认就会断开管道（但 Worker 仍能读到断开前已写入管道的请求，2026-10-16 实测），所以"已接受"回复发送失败时 Worker 仍须等引擎结束、写出结果文件后再退出，否则主窗口只能报告"没有返回结果"。
 - `migration-engine.ps1`：Analyze（预检）、Migrate（robocopy 复制 + 校验 + 源目录改名备份 + 建顶层 SymbolicLink + 删除备份）、Cleanup（删除改名前失败或已回滚遗留的目标副本）、Restore（把中断迁移的备份改回原路径）。后三者持有 `Global\mklinktool-engine` 互斥锁。
 - **提交点**：Migrate 中链接建立并验证通过、且改名后的备份与复制校验时的来源快照一致（路径、大小、修改时间、嵌套链接）后即视为提交（`$jobSucceeded`）；复核发现差异说明来源在校验后仍被写入，按建链失败回滚。提交点之后的任何异常只能记警告、不得回滚——回滚会删掉正在工作的链接，若备份已被部分删除还会把残缺目录改回原路径（2026-10-14 故障注入实测）。
-- 会话目录：`%TEMP%\mklinktool-<guid>\`（job.json / state.json / engine.log / robocopy.log）。中断恢复记录：`%LOCALAPPDATA%\mklinktool\pending\<会话名>.json`，迁移前写入，全部成功后删除，启动时按文件系统实际状态复查。
+- 会话目录：`%TEMP%\mklinktool-<guid>\`（job.json / state.json / engine.log / robocopy.log / result-*.json），每个任务一个。主窗口显示时由 `Remove-StaleSessionDirectories` 删除超过 7 天（`$script:SessionRetentionDays`）的会话：只删名称严格匹配、只含普通文件、本身不是链接的目录，按其中最晚的修改时间计算。中断恢复记录：`%LOCALAPPDATA%\mklinktool\pending\<会话名>.json`，迁移前写入，全部成功后删除，启动时按文件系统实际状态复查。
 - 安全模型：管道名含 128 位 GUID；GUI 校验 client PID、Worker 校验 server PID；管道 ACL 授予当前用户 + `BUILTIN\Administrators`（后者是为了"另一个管理员账号"OTS 提权场景）。
 - UI 与引擎之间唯一的进度通道是 `state.json`（引擎 tmp+Replace 原子写，UI 每 500ms 轮询）。每项结果带 `Index`（job.json 中的顺序），GUI 按序号匹配，不按路径文本匹配。作业的 `Status` 只存状态码，显示时由 `Convert-StatusText` 转中文。state.json 还带引擎自己的 `EnginePid`/`EngineStartTime`，供跟踪模式判断引擎是否仍在运行。
 - **轮询顺序**：每次先判定任务是否结束（结果文件、Worker 与引擎进程），再读日志和 state.json。Worker 只在引擎退出后才写结果、才退出，所以先确认结束、后读取，读到的必是最终状态；反过来，引擎的最后一次写入可能恰好落在两步之间而被永久漏掉（2026-10-15 用测试桩复现）。
@@ -24,7 +24,7 @@
 | `.ps1` | UTF-8 **带 BOM** | PS 5.1 尊重 BOM 正确解码中文；PowerShell 7 默认 UTF-8；grep/diff/常见工具链友好。UTF-16LE 虽然也能被 PS 5.1 识别，但会让文本工具看到 NUL 字节、体积翻倍（2026-10 的编码损坏事故即因此难以排查）。 |
 | `.cmd` / `.bat` | 纯 ASCII | cmd 无法解析 UTF-16；UTF-8 BOM 在部分 cmd 版本会破坏首行 `@echo off`。 |
 | 数据文件（job.json / state.json / engine.log） | UTF-8 无 BOM，**读写两侧都必须显式指定编码** | GUI 写入用 `UTF8Encoding($false)`；引擎/ GUI 读取必须带 `-Encoding UTF8` 或 `Encoding.UTF8`，否则 PS 5.1 默认按 ANSI 解码。 |
-| robocopy.log | **绝不预写** | 由 `/UNILOG+` 独占创建/追加，编码随 robocopy 版本而定（新版本实测为单字节/UTF-8，旧版本为 UTF-16 LE）。预写其他编码会造成编码混合。 |
+| robocopy.log | **绝不预写** | 由 `/UNILOG+` 独占创建/追加，编码随 robocopy 版本而定（新版本实测为单字节/UTF-8，旧版本为 UTF-16 LE）。预写其他编码会造成编码混合。引擎带 `/NFL /NDL` 运行 robocopy：日志只有出错项与汇总，实测出错行仍带完整路径与原因。 |
 
 **换行**：仓库内统一存 LF；`.gitattributes` 让 `.ps1`、`.cmd` 检出为 CRLF，不受各人 `core.autocrlf` 设置与 GitHub ZIP 下载方式影响。
 
@@ -85,17 +85,19 @@
 
 - 涉及符号链接/特权的测试要用真实文件系统状态（而非仅 API 返回值）做断言。早先记录的"沙箱内 flags 1 假成功"实为 P/Invoke 封送错误（见"符号链接"一节）。
 - 复杂 PowerShell 测试一律写成 `.ps1` 文件用 `powershell.exe -File` 执行；内联 `-Command` 的多层引号转义几乎必炸。
-- 含中文的测试脚本同样必须存成 UTF-8 带 BOM，否则 PS 5.1 按 GBK 解码，中文注释可能吞掉换行、破坏代码。通过 Bash heredoc 生成文件时 `\\` 会被吞成 `\`（`\\?\` 前缀被破坏），这类内容改用文件写入工具或 PowerShell 写出。
+- 含中文的测试脚本同样必须存成 UTF-8 带 BOM，否则 PS 5.1 按 GBK 解码，中文注释可能吞掉换行、破坏代码。典型症状是不报语法错误，注释下一行的语句却像没执行一样（变量为 `$null`）。文件写入工具通常写出无 BOM 的 UTF-8，写完记得转换。通过 Bash heredoc 生成文件时 `\\` 会被吞成 `\`（`\\?\` 前缀被破坏），这类内容改用文件写入工具或 PowerShell 写出。
 - **测试必须跑在产品目标运行时上**：Windows PowerShell 5.1（powershell.exe）与 PowerShell 7（pwsh）在编码默认值、长路径、API 表面上行为不同；本项目目标是 PS 5.1。
 - 非提权运行引擎做端到端测试时（开发者模式下顶层建链可成功），Robocopy `/SL` 无法创建**嵌套符号链接**（需要 `SeCreateSymbolicLinkPrivilege`），复制校验会报"嵌套链接数不一致"。嵌套链接用 Junction 测，嵌套符号链接需提权测试。
-- 仓库中**没有**入库的测试文件。2026-10-14 一轮（引擎端到端 + 故障注入 48 项、GUI 函数与界面冒烟 43 项）与 2026-10-15 一轮（引擎 31 项、GUI 39 项）的方法如下，需要时按此重建：
-  - 引擎：复制一份引擎，用"正则匹配唯一一行并替换为 `throw`"的方式注入故障，再以 `-File` 运行。覆盖矩阵：建链失败（回滚 + 后续项 NotStarted）、提交点后异常（不得回滚）、备份删除中途失败 + 警告日志写入失败（不得回滚）、删除前枚举失败（提示"完整保留"）。
+- **测试在 `tests/` 中**（2026-10-16 入库）：`powershell.exe -NoProfile -ExecutionPolicy Bypass -File tests\Invoke-AllTests.ps1` 依次运行 `Test-Static.ps1`（所有 `.ps1` 语法与 BOM、`.cmd` 纯 ASCII）、`Test-Engine.ps1`（引擎端到端与故障注入）、`Test-Gui.ps1`（假 Worker）与 `Test-Gui.ps1 -Mode RealWorker`（真实 Worker 与引擎以普通权限运行），按各自的 `SUMMARY pass= fail=` 行汇总，有失败时退出码为 1，约 50 秒。加 `-IncludeElevated` 再跑 `Test-Gui.ps1 -Mode Elevated`：仓库里原样的 Worker 经 UAC 提权，需要有人点一次“是”。发起请求的进程不在前台时，UAC 提示可能不直接切到安全桌面，只在任务栏闪烁，要点开才出现；约 2 分钟无人响应会自动取消，测试随即失败、不做任何改动。共用函数在 `TestHelpers.ps1`（断言、摘要、安全删除测试目录）与 `gui\GuiHarness.ps1`。需要开发者模式（或管理员身份）与桌面会话；只在 `%TEMP%` 下的临时目录里工作并自行清理。改动三个脚本后都应跑一遍；新增行为同时补用例。实现方法如下：
+  - 引擎：复制一份引擎，用"正则匹配唯一一行并插入或替换为测试代码"的方式注入故障，再以 `-File` 运行。覆盖：正常迁移（删除/保留备份）、N5 的三个写入时机、建链失败回滚与后续项 NotStarted、提交点后异常不回滚、备份删除中途失败与删除前枚举失败的提示、跨任务冲突写回各行、Cleanup（不跟随链接、三种拒绝情形）、Restore、引擎互斥锁。
   - 引擎辅助函数：用 `[Parser]::ParseFile` 取 AST，把 `Add-Type` 与所需函数的 `Extent.Text` 点调用进测试会话。
   - GUI：把 GUI 脚本副本末尾的 `[void]$form.ShowDialog()` 替换为点调用测试主体（在 GUI 作用域内运行），窗体移到屏幕外 `Show()`，伪造 state.json / engine.log / result 文件后调用 `Update-WorkerView`。注意：点调用脚本里的 `exit` 退出码传不出 `-File` 进程，按输出摘要判断成败；会弹 MessageBox 的函数需在测试主体里重定义为桩。
   - 轮询时序：在测试主体里重定义 `Refresh-Grid`（它位于一次轮询的中间），第一次调用时写入最终 state.json 与结果文件，即可确定性地复现“结束发生在两步之间”。
   - Worker 协议与跟踪模式：把 `Connect-ElevatedWorker` 重定义为空函数，测试主体自建 `NamedPipeServerStream`，另起一个 PowerShell 进程扮演 Worker（读请求后按模式：正常接受 / 不回复但照样写结果 / 回复 Error / 直接退出 / 留下仍在运行的“引擎”后退出），把它的 `Process` 对象赋给 `$script:Worker`。`$script:RecoveryJournalRoot` 指到临时目录，避免写入真实的中断恢复记录。
   - 完整性级别的模拟：非提权测试里，用 `SetSecurityInfo` 给替身进程加拒绝 `PROCESS_QUERY_INFORMATION`（0x400）与 `SYNCHRONIZE`（0x100000）的 ACE，即可重现主窗口访问提权引擎时拿不到的权限。
-- 修改三个脚本后最低限度回归：`[System.Management.Automation.Language.Parser]::ParseFile()` 三个文件 0 语法错误 + 文件头 BOM 检查。
+  - 会话目录清理：测试主体先保存 `${function:Remove-StaleSessionDirectories}` 再把它换成桩（窗口显示时会调用它，不能让测试清理真实的 `%TEMP%`），然后对临时根目录调用保存的原函数。
+  - 真实 Worker（`gui\WorkerTests.Body.ps1`）：不桩 `Connect-ElevatedWorker`，走真实的管道、PID 校验、握手与引擎。普通权限模式由启动器复制一份去掉提权检查的 Worker（与引擎放在同一目录），并去掉 GUI 副本里的 `-Verb RunAs`；提权模式用仓库原样的 Worker，并把副本里等待连接的 30 秒放宽到 120 秒。让来源改名失败的做法：用 `FileShare.Read`（不含 Delete）打开来源里的一个文件，目录改名会报“访问被拒绝”，但文件仍能被 Robocopy 读取复制。模拟确认丢失：把 `$script:WorkerReadTimeoutMs` 设为 1。
+- 修改三个脚本后最低限度回归：`tests\Test-Static.ps1`（语法 + BOM）；能跑全套时跑 `tests\Invoke-AllTests.ps1`。
 
 ## 已知边界
 

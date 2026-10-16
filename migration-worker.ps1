@@ -169,7 +169,14 @@ try {
                 (ConvertTo-ProcessArgument $logPath),
                 (ConvertTo-ProcessArgument $robocopyLogPath))
             $engineProcess = Start-Process -FilePath $powershellPath -ArgumentList $arguments -PassThru -WindowStyle Hidden
-            Send-Message $writer @{ Type = 'Accepted'; RequestId = $requestId; Action = $action; EnginePid = $engineProcess.Id; EngineStartTime = $engineProcess.StartTime.ToFileTime() }
+            # 主窗口等不到确认时会断开管道、改为跟踪结果文件：回复发不出去也要等引擎结束并写出结果，
+            # 否则主窗口只能报告“没有返回结果”。管道既已断开，写完结果后退出。
+            $replySent = $true
+            try {
+                Send-Message $writer @{ Type = 'Accepted'; RequestId = $requestId; Action = $action; EnginePid = $engineProcess.Id; EngineStartTime = $engineProcess.StartTime.ToFileTime() }
+            } catch {
+                $replySent = $false
+            }
 
             $parentEnded = Wait-EngineExit $engineProcess $parentProcess
             $engineProcess.Refresh()
@@ -194,7 +201,7 @@ try {
             [System.IO.File]::WriteAllText($temporaryResultPath, ($result | ConvertTo-Json -Depth 4), $utf8)
             [System.IO.File]::Move($temporaryResultPath, $resultPath)
             $engineProcess.Dispose()
-            if ($parentEnded) { $shouldStop = $true }
+            if ($parentEnded -or -not $replySent) { $shouldStop = $true }
         } catch {
             if ($null -ne $engineProcess) {
                 try {

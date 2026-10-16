@@ -38,6 +38,8 @@ $script:LastAnalysisSignature = ''
 $script:ContextPath = ''
 # 每次迁移开始前写入一份中断恢复记录，启动时据此检测“备份存在而原路径缺失”。
 $script:RecoveryJournalRoot = Join-Path ([Environment]::GetFolderPath('LocalApplicationData')) 'mklinktool\pending'
+# 会话目录（%TEMP%\mklinktool-<GUID>：任务清单、状态、引擎与 Robocopy 日志、结果）的保留天数，主窗口启动时删除更早的会话。
+$script:SessionRetentionDays = 7
 # Everyone / Authenticated Users / Users / INTERACTIVE：本机任意账户都属于的宽泛组。
 $script:BroadPrincipalSids = @('S-1-1-0', 'S-1-5-11', 'S-1-5-32-545', 'S-1-5-4')
 # 能修改内容、删除或改写权限的访问位，另含 GENERIC_WRITE(0x40000000) 与 GENERIC_ALL(0x10000000)。
@@ -469,6 +471,40 @@ function Find-InterruptedMigrations {
         }
     }
     return $found.ToArray()
+}
+
+function Remove-StaleSessionDirectories([string]$Root, [int]$RetentionDays) {
+    # 删除超过保留期的会话目录，返回删除的个数。只处理名称严格为 mklinktool-<32 位十六进制> 的直接子目录，
+    # 按目录及其中文件的最晚修改时间判断是否过期（仍在写入的会话不会过期）。目录本身是链接，或其中出现
+    # 子目录、链接这类会话里本不该有的条目时整个跳过：只删普通文件，不做递归删除。
+    if ([string]::IsNullOrWhiteSpace($Root) -or -not [System.IO.Directory]::Exists($Root)) { return 0 }
+    $cutoff = [DateTime]::UtcNow.AddDays(-$RetentionDays)
+    $removed = 0
+    foreach ($directory in [System.IO.DirectoryInfo]::new($Root).GetDirectories('mklinktool-*')) {
+        try {
+            if ($directory.Name -notmatch '^mklinktool-[0-9a-fA-F]{32}$') { continue }
+            if (($directory.Attributes -band [System.IO.FileAttributes]::ReparsePoint) -ne 0) { continue }
+            $entries = @($directory.GetFileSystemInfos())
+            $unexpected = @($entries | Where-Object { ($_.Attributes -band ([System.IO.FileAttributes]::Directory -bor [System.IO.FileAttributes]::ReparsePoint)) -ne 0 })
+            if ($unexpected.Count -gt 0) { continue }
+            $latest = $directory.LastWriteTimeUtc
+            foreach ($entry in $entries) {
+                if ($entry.LastWriteTimeUtc -gt $latest) { $latest = $entry.LastWriteTimeUtc }
+            }
+            if ($latest -gt $cutoff) { continue }
+            foreach ($entry in $entries) {
+                if (($entry.Attributes -band [System.IO.FileAttributes]::ReadOnly) -ne 0) {
+                    [System.IO.File]::SetAttributes($entry.FullName, [System.IO.FileAttributes]::Normal)
+                }
+                [System.IO.File]::Delete($entry.FullName)
+            }
+            [System.IO.Directory]::Delete($directory.FullName)
+            $removed++
+        } catch {
+            # 文件被占用等：留到下次启动再试。
+        }
+    }
+    return $removed
 }
 
 function ConvertTo-WorkerMessageJson([hashtable]$Message) {
@@ -1461,6 +1497,13 @@ $form.Add_DragDrop($dragDropHandler)
 $grid.Add_DragEnter($dragEnterHandler)
 $grid.Add_DragDrop($dragDropHandler)
 $form.Add_Shown({
+    # 整理临时文件：删除超过保留期的旧会话目录。失败不影响启动。
+    try {
+        $removedSessions = Remove-StaleSessionDirectories ([System.IO.Path]::GetTempPath()) $script:SessionRetentionDays
+        if ($removedSessions -gt 0) {
+            $logTextBox.AppendText(('已清理 {0} 个超过 {1} 天的旧会话目录。' -f $removedSessions, $script:SessionRetentionDays) + [Environment]::NewLine)
+        }
+    } catch { }
     # 检测上次在“源目录已改名为备份、尚未创建链接”时中断（断电、强制结束）的迁移，提示把备份改回原路径。
     $interrupted = @(Find-InterruptedMigrations)
     if ($interrupted.Count -eq 0) { return }

@@ -76,6 +76,6 @@ Robocopy 使用 `/COPY:DAT /DCOPY:DAT`，保留文件与目录的数据、属性
 
 完整的仓库文件索引、运行调用链和代码审查摘要见 [`PROJECT_OVERVIEW.md`](PROJECT_OVERVIEW.md)。
 
-程序运行入口是 `migrate-local-folders.cmd`；主窗口由 `migrate-local-folders.ps1` 提供，提权任务经 `migration-worker.ps1` 转交给 `migration-engine.ps1`。`README.md` 是使用指南，`DESIGN.md` 记录架构与安全决策。以 `PLAN_` 或 `plan-` 开头的文件是方案/实现记录，`operation-notes.md` 是历史迁移记录；这些文件都不是运行入口，也不会自动成为迁移作业清单。
+程序运行入口是 `migrate-local-folders.cmd`；主窗口由 `migrate-local-folders.ps1` 提供，提权任务经 `migration-worker.ps1` 转交给 `migration-engine.ps1`。`README.md` 是使用指南，`DESIGN.md` 记录架构与安全决策。以 `PLAN_` 或 `plan-` 开头的文件是方案/实现记录，`operation-notes.md` 是历史迁移记录；这些文件都不是运行入口，也不会自动成为迁移作业清单。`tests\` 是开发用的自动化测试，使用工具时用不到。
 
-每次任务的引擎和 Robocopy 日志保存在 `%TEMP%\mklinktool-<任务编号>`。窗口的“打开日志目录”按钮可直接打开。
+每次扫描、迁移、清理或恢复都会在 `%TEMP%\mklinktool-<任务编号>` 留下一个会话目录，里面是任务清单、进度、引擎日志、Robocopy 日志和结果。窗口的“打开日志目录”按钮可直接打开本窗口最近一次的会话。Robocopy 日志只记录出错的文件（带完整路径和原因）与汇总，不逐条列出正常复制的文件。主窗口每次启动时会删除超过 7 天的会话目录。
