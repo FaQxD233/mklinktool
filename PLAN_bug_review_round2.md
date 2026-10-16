@@ -636,3 +636,16 @@ README（启动失败提示、来源卷的限制、D2 选项）、DESIGN（安�
 默认套件 202 项全部通过（静态 27、引擎 74、GUI（假 Worker）58、GUI（真实 Worker）38、启动 5），约 72 秒。本轮没有改动 Worker 与提权路径，没有运行提权模式。
 
 **实施中踩到的问题**：给 `Get-WorkerCompletion` 加的注释第一版原样写了 `Start-Process -Verb RunAs -PassThru`。`Test-Gui.ps1 -Mode RealWorker` 要在 GUI 副本中替换 ` -Verb RunAs`，并要求它只出现一次，于是这组测试整组没有运行（报 found 2）。注释改写后恢复正常；AGENTS 的测试说明里补了提醒：产品代码的注释不要原样重复测试要替换的文本。
+
+### 14.8 补充：长路径与 LongPathsEnabled（2026-10-17）
+
+用户表示不记得开过长路径支持。下面是只读核查与非提权实测的结果，AGENTS.md 的“长路径”一节已据此更正。
+
+| 编号 | 用例 | 结果 |
+|---|---|---|
+| V13 | 读注册表与安装记录 | `LongPathsEnabled` 为 1。它所在的键最后修改于 2023-06-20 22:58，此后没有改动；当天 10:42 装的 Windows，同日装了 Python 3.9.13，其安装程序的 “Disable path length limit” 改的就是这一项。与本项目无关 |
+| V14 | 在 5.1 与 7 下对比 `Path` 的四个方法 | 5.1：由 36 字符的段组成、共 298 字符的路径都正常；路径中有一段 300 字符时，`GetFullPath`、`GetDirectoryName`、`GetPathRoot` 抛 `PathTooLongException`，`GetFileName` 正常。7：都正常 |
+| V15 | 5.1 的路径处理开关从哪里来 | `UseLegacyPathHandling`、`BlockLongPaths` 均为 false；`powershell.exe.config` 与 `HKLM\SOFTWARE\Microsoft\.NETFramework\AppContext` 都没有设置，开关名见于 `System.Management.Automation.dll`，即由 PowerShell 自己设置，与 `LongPathsEnabled` 无关。`powershell.exe` 的清单声明了 `longPathAware`，`robocopy.exe` 没有 |
+| V16 | 真实引擎处理深层目录（最深文件路径 351 字符） | 两个来源都通过预检（其中一个在同样深的位置含相对目录符号链接）；只含深层文件的来源迁移成功，经新链接能读到最深的文件 |
+
+结论：这个开关只影响把不带 `\\?\` 的长路径直接交给 Win32 的调用，引擎都自己加前缀，不依赖它。AGENTS.md 原先“只在未启用该开关时抛异常、开发机启用了所以相关分支测不到”的说法不成立，`GetPathRoot` 也不是纯字符串操作。用户决定只更新文档，不新增长路径的自动测试，也不做“主窗口拒绝在 PowerShell 7 下运行”的改动。

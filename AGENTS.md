@@ -38,7 +38,9 @@
 ## Windows PowerShell 5.1 / .NET Framework 陷阱
 
 **长路径（>260 字符）**：
-- `[IO.Path]::GetFullPath`、`GetDirectoryName` 会抛 `PathTooLongException`；`GetPathRoot`/`GetFileName` 是纯字符串操作，安全。**仅在系统未启用 `LongPathsEnabled` 时如此**（Windows 默认未启用）；当前开发机启用了它，长路径不抛异常，相关分支在本机测试中不会被触发。
+- Windows PowerShell 5.1 启动时自己关掉了 .NET Framework 的旧式路径处理：`Switch.System.IO.UseLegacyPathHandling` 与 `Switch.System.IO.BlockLongPaths` 均为 false，开关名写在 `System.Management.Automation.dll` 里，`powershell.exe.config` 与注册表 `HKLM\SOFTWARE\Microsoft\.NETFramework\AppContext` 都没有设置。因此 `GetFullPath`、`GetDirectoryName`、`GetPathRoot` 处理总长超过 260 字符的路径不会抛异常，每台装有 5.1 的电脑都一样，与系统的 `LongPathsEnabled` 无关（2026-10-17 实测：由 36 字符的段组成、共 298 字符的路径均正常）。单段名字超过 255 个字符时这三个方法仍抛 `PathTooLongException`（这是 NTFS 本身的上限，枚举得到的真实路径不会出现）；`GetPathRoot` 也会先规范化路径，不是纯字符串操作，只有 `GetFileName` 不做检查。PowerShell 7 对这四个方法都不检查。此前这里写的“只在未启用 `LongPathsEnabled` 时抛异常、开发机启用了它所以不抛、相关分支在本机测不到”是错的。
+- `LongPathsEnabled`（`HKLM\SYSTEM\CurrentControlSet\Control\FileSystem`）只影响把不带 `\\?\` 前缀的长路径直接交给 Win32 的调用，而且只对清单声明了 `longPathAware` 的程序生效：`powershell.exe` 声明了，`robocopy.exe` 没有（Robocopy 自己处理长路径）。引擎调用 Win32 时都自己加 `\\?\`，不依赖这个开关。开发机上它从 2023-06-20 装系统当天起就开着（该注册表键此后没有改动过；当天还装了 Python 3.9.13，其安装程序的 “Disable path length limit” 改的就是这一项，最可能是它）。Windows 默认关闭；开关关闭时的情况没有实测过。
+- 深层目录实测（2026-10-17，真实引擎，非提权，在 `%TEMP%` 下）：两个来源的最深文件路径都是 351 字符，其中一个在同样深的位置含相对目录符号链接，预检都通过；只含深层文件的那个随后迁移成功，经新链接能读到最深的文件。长路径目前没有自动测试覆盖。
 - `GetFullPath` 本身会展开 8.3 短名，末段不存在时也会展开已存在的前缀（实测 `C:\PROGRA~1\nonexistent\sub` → `C:\Program Files\nonexistent\sub`）；只有 `PathTooLongException` 分支需要手工 `GetLongPathNameW`。
 - 设备路径（`\\?\C:\...`、UNC 用 `\\?\UNC\`）跳过长度检查，且 .NET Fx 对其原样返回不做归并——`\\?\` 路径必须用反斜杠。
 - PS 5.1 cmdlet（`Get-Item`/`Rename-Item`/`New-Item`/`Get-ChildItem`）不支持长路径；用 .NET + `\\?\` 替代：改名用 `[IO.Directory]::Move`，枚举用 `[IO.Directory]::EnumerateFileSystemEntries`。
