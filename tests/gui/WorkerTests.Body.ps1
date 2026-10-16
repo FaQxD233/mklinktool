@@ -57,6 +57,13 @@ function Get-LinkType([string]$Path) {
     return [string][System.IO.DirectoryInfo]::new($Path).LinkType
 }
 
+function Invoke-Git([string[]]$Arguments) {
+    # GUI 脚本的错误偏好是 Stop，git 写到 stderr 的提示会变成终止错误；这里临时放宽，返回输出与退出码。
+    $ErrorActionPreference = 'Continue'
+    $output = @(& git @Arguments 2>&1 | ForEach-Object { "$_" }) -join "`n"
+    return [pscustomobject]@{ ExitCode = $LASTEXITCODE; Output = $output }
+}
+
 function New-InjectedWorker([string]$Name, [string]$Anchor, [string]$Replacement) {
     # 在 Worker 副本中把唯一匹配的一行替换为测试代码，另存到同一目录（Worker 按自身所在目录找引擎）。
     $text = Set-UniqueText ([System.IO.File]::ReadAllText($script:TestWorkerPath, [System.Text.Encoding]::UTF8)) $Anchor $Replacement
@@ -139,6 +146,51 @@ try {
     Start-Worker 'Restore' $restoreItems $restoreConfig
     Assert (Wait-TaskEnd 120000) 'restore finished'
     Assert ($restoreItems[0].Status -eq 'Restored' -and [System.IO.File]::Exists((Join-Path $sourceC 'data.txt')) -and -not [System.IO.Directory]::Exists($sourceC + '_migration_backup')) 'backup moved back' "$($restoreItems[0].Status) $($restoreItems[0].Error)"
+
+    # 放在 X5 之前：X5 结束时 Worker 会退出，之后再迁移就要重启 Worker，提权模式下会多弹一次 UAC。
+    '[X9] A migrated Git repository keeps its owners, and Git (default configuration) accepts it'
+    if ($null -eq (Get-Command git -ErrorAction SilentlyContinue)) {
+        '  SKIP git not found'
+    } else {
+        # 隔离 Git 配置：不读用户与系统配置（例如 safe.directory = *），看到的是 Git 的默认行为。
+        $gitConfig = Join-Path $root 'isolated.gitconfig'
+        [System.IO.File]::WriteAllText($gitConfig, '', $utf8)
+        $savedNoSystem = $env:GIT_CONFIG_NOSYSTEM
+        $savedGlobal = $env:GIT_CONFIG_GLOBAL
+        $env:GIT_CONFIG_NOSYSTEM = '1'
+        $env:GIT_CONFIG_GLOBAL = $gitConfig
+        try {
+            $sourceE = Join-Path $root 'src\E'
+            $targetE = Join-Path $root 'dst\E'
+            New-TextFile (Join-Path $sourceE 'readme.txt') 'repo'
+            [void](Invoke-Git @('-C', $sourceE, 'init', '-q'))
+            [void](Invoke-Git @('-C', $sourceE, 'add', '-A'))
+            $commit = Invoke-Git @('-C', $sourceE, '-c', 'user.name=mkl-test', '-c', 'user.email=mkl-test@example.invalid', 'commit', '-q', '-m', 'init')
+            $sourceOwners = @($sourceE, (Join-Path $sourceE '.git'), (Join-Path $sourceE 'readme.txt')) | ForEach-Object { (Get-Acl -LiteralPath $_).Owner }
+            Assert ($commit.ExitCode -eq 0 -and (Invoke-Git @('-C', $sourceE, 'status', '--porcelain')).ExitCode -eq 0) 'test repository created and usable before migration' $commit.Output
+
+            $script:Jobs.Clear()
+            [void]$script:Jobs.Add((New-TestJob $sourceE $targetE))
+            Refresh-Grid
+            Start-Worker 'Analyze' @($script:Jobs) (Get-WorkerConfig)
+            Assert ((Wait-TaskEnd 120000) -and $script:PlanValid) 'repository passes preflight' "$($script:Jobs[0].Status) $($script:Jobs[0].Error)"
+            Start-Worker 'Migrate' @($script:Jobs) (Get-WorkerConfig)
+            Assert ((Wait-TaskEnd 180000) -and $script:Jobs[0].Status -eq 'Complete') 'repository migrated' "$($script:Jobs[0].Status) $($script:Jobs[0].Error)"
+
+            $targetOwners = @($targetE, (Join-Path $targetE '.git'), (Join-Path $targetE 'readme.txt')) | ForEach-Object { (Get-Acl -LiteralPath $_).Owner }
+            "  INFO owners before migration (root, .git, file): $($sourceOwners -join ', ')"
+            "  INFO owners after migration  (root, .git, file): $($targetOwners -join ', ')"
+            Assert (($targetOwners -join '|') -eq ($sourceOwners -join '|')) 'target root, .git and files keep the source owners' "$($sourceOwners -join ', ') -> $($targetOwners -join ', ')"
+            foreach ($view in @(@('original path (link)', $sourceE), @('target path', $targetE))) {
+                $status = Invoke-Git @('-C', $view[1], 'status', '--porcelain')
+                "  INFO git status via the $($view[0]): exit $($status.ExitCode) $($status.Output)"
+                Assert ($status.ExitCode -eq 0) "git accepts the migrated repository via the $($view[0])" $status.Output
+            }
+        } finally {
+            $env:GIT_CONFIG_NOSYSTEM = $savedNoSystem
+            $env:GIT_CONFIG_GLOBAL = $savedGlobal
+        }
+    }
 
     '[X5] Lost confirmation: the worker still writes the result, tracking ends normally'
     $script:Jobs.Clear()

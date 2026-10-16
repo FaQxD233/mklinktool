@@ -367,6 +367,53 @@ function New-TargetRootWithSourceAccess([string]$Source, [string]$Target) {
     [System.IO.Directory]::SetAccessControl($extendedTarget, $targetSecurity)
 }
 
+function Copy-TreeOwners([string]$SourceRoot, [string]$TargetRoot) {
+    # 提权引擎新建的目录与文件归 Administrators 组所有，而不是来源原本的所有者；Git 在普通权限下会因此拒绝打开迁移后的仓库
+    # （detected dubious ownership，两点均经提权实测）。复制后逐项把目标的所有者改回来源对应项的所有者。
+    # 只沿用引擎无需额外特权就能指定的所有者：引擎自身的用户，以及提权时的 Administrators 组；SYSTEM、TrustedInstaller、
+    # 其他账户所有的项保持默认所有者。不用 Robocopy /COPY:O：指定不了的所有者会报 1307，实测还跳过了该目录的内容、退出码却为 0。
+    # 嵌套链接不进入、也不改动。返回沿用了来源所有者的项数，以及因无权指定或设置失败而保持默认所有者的项数。
+    $identity = [System.Security.Principal.WindowsIdentity]::GetCurrent()
+    $assignableSids = @($identity.User.Value)
+    if ((New-Object System.Security.Principal.WindowsPrincipal($identity)).IsInRole([System.Security.Principal.WindowsBuiltInRole]::Administrator)) {
+        $assignableSids += 'S-1-5-32-544'
+    }
+    $ownerSection = [System.Security.AccessControl.AccessControlSections]::Owner
+    $sourcePrefix = (Get-ExtendedLengthPath (ConvertTo-FullPath $SourceRoot)).TrimEnd('\')
+    $targetPrefix = (Get-ExtendedLengthPath (ConvertTo-FullPath $TargetRoot)).TrimEnd('\')
+    $result = [pscustomobject]@{ Copied = 0; Kept = 0 }
+    $directories = New-Object 'System.Collections.Generic.Queue[System.IO.DirectoryInfo]'
+    $sourceRootItem = [System.IO.DirectoryInfo]::new($sourcePrefix)
+    $directories.Enqueue($sourceRootItem)
+    $items = New-Object 'System.Collections.Generic.List[System.IO.FileSystemInfo]'
+    $items.Add($sourceRootItem)
+    while ($directories.Count -gt 0) {
+        # 读不了的目录只计数：随后的复制校验会遍历同一棵树，并给出明确的错误。
+        try { $entries = $directories.Dequeue().GetFileSystemInfos() } catch { $result.Kept++; continue }
+        foreach ($entry in $entries) {
+            if (($entry.Attributes -band [System.IO.FileAttributes]::ReparsePoint) -ne 0) { continue }
+            $items.Add($entry)
+            if (($entry.Attributes -band [System.IO.FileAttributes]::Directory) -ne 0) { $directories.Enqueue([System.IO.DirectoryInfo]$entry) }
+        }
+    }
+    foreach ($item in $items) {
+        try {
+            $owner = $item.GetAccessControl($ownerSection).GetOwner([System.Security.Principal.SecurityIdentifier])
+            $targetPath = $targetPrefix + $item.FullName.Substring($sourcePrefix.Length)
+            $isDirectory = ($item.Attributes -band [System.IO.FileAttributes]::Directory) -ne 0
+            $targetSecurity = if ($isDirectory) { [System.IO.Directory]::GetAccessControl($targetPath, $ownerSection) } else { [System.IO.File]::GetAccessControl($targetPath, $ownerSection) }
+            if ($targetSecurity.GetOwner([System.Security.Principal.SecurityIdentifier]).Value -eq $owner.Value) { continue }
+            if ($assignableSids -notcontains $owner.Value) { $result.Kept++; continue }
+            $targetSecurity.SetOwner($owner)
+            if ($isDirectory) { [System.IO.Directory]::SetAccessControl($targetPath, $targetSecurity) } else { [System.IO.File]::SetAccessControl($targetPath, $targetSecurity) }
+            $result.Copied++
+        } catch {
+            $result.Kept++
+        }
+    }
+    return $result
+}
+
 function Get-ContainedDirectoryLinkInfo($Entry, [string]$RootPath, [string]$AbsoluteLinkRoot, [bool]$RequireTargetExists = $true) {
     $Path = ConvertFrom-ExtendedLengthPath $Entry.FullName
     $attributes = $Entry.Attributes
@@ -944,6 +991,11 @@ function Invoke-Migration($Config) {
                 throw "Robocopy 失败，退出码 $copyResult；源目录保留在原处，目标副本保留。"
             }
             Write-Log "Robocopy 结束，退出码 $copyResult（0 到 7 均为成功状态）。"
+            # 所有者只影响元数据，不影响下面的内容校验；沿用不了的项只记录，不让迁移失败。
+            $owners = Copy-TreeOwners -SourceRoot $source -TargetRoot $target
+            if ($owners.Copied -gt 0 -or $owners.Kept -gt 0) {
+                Write-Log ('所有者：{0} 项改为来源中的所有者；{1} 项保持默认所有者（Administrators 组），因为来源所有者是 SYSTEM、TrustedInstaller 或其他账户，引擎无权指定，或设置失败。' -f $owners.Copied, $owners.Kept)
+            }
 
             $analysis.Status = 'Verifying'
             $script:State.Phase = 'Verifying'
