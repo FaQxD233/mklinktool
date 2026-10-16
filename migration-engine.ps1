@@ -50,8 +50,14 @@ public static class MklinkToolWin32 {
     [StructLayout(LayoutKind.Sequential)]
     public struct FileFsDeviceInformation { public uint DeviceType; public uint Characteristics; }
 
+    [StructLayout(LayoutKind.Sequential)]
+    public struct FileFsFullSizeInformation { public long TotalAllocationUnits; public long CallerAvailableAllocationUnits; public long ActualAvailableAllocationUnits; public uint SectorsPerAllocationUnit; public uint BytesPerSector; }
+
     [DllImport("ntdll.dll")]
     public static extern int NtQueryVolumeInformationFile(SafeFileHandle FileHandle, out IoStatusBlock IoStatusBlock, out FileFsDeviceInformation FsInformation, uint Length, int FsInformationClass);
+
+    [DllImport("ntdll.dll")]
+    public static extern int NtQueryVolumeInformationFile(SafeFileHandle FileHandle, out IoStatusBlock IoStatusBlock, out FileFsFullSizeInformation FsInformation, uint Length, int FsInformationClass);
 }
 '@
 $script:State = [ordered]@{
@@ -285,34 +291,47 @@ function Test-SymbolicLinkCreation {
 }
 
 function Get-DirectoryVolumeInfo([string]$ExtendedPath) {
-    # 按句柄查询目录实际所在的卷：CreateFile 会跟随路径中的挂载文件夹、Junction 与符号链接。按路径字符串或盘符判断会漏判，
-    # 实测 C: 上指向网络共享的目录符号链接，GetVolumePathName 仍报告 C:\（固定磁盘）。
+    # 按句柄查询目录实际所在的卷，来源与目标两侧共用：CreateFile 会跟随路径中的挂载文件夹、Junction 与符号链接。按路径字符串或盘符判断会用错卷，
+    # 实测 C: 上指向网络共享的目录符号链接，GetVolumePathName 仍报告 C:\（固定磁盘）；经 Junction 落到 E: 的路径，按盘符取到的是 C: 的可用空间。
     # 0x80 = FILE_READ_ATTRIBUTES；7 = 读、写、删除全共享；3 = OPEN_EXISTING；0x02000000 = FILE_FLAG_BACKUP_SEMANTICS（打开目录必需）。
     $displayPath = ConvertFrom-ExtendedLengthPath $ExtendedPath
     $handle = [MklinkToolWin32]::CreateFileW($ExtendedPath, 0x80, 7, [IntPtr]::Zero, 3, 0x02000000, [IntPtr]::Zero)
     if ($handle.IsInvalid) {
-        throw "无法确认来源所在的卷能否建立符号链接（打开目录失败，Win32 错误码 $([System.Runtime.InteropServices.Marshal]::GetLastWin32Error())）：$displayPath"
+        throw "无法查询目录所在的卷（打开目录失败，Win32 错误码 $([System.Runtime.InteropServices.Marshal]::GetLastWin32Error())）：$displayPath"
     }
     try {
         $ioStatus = New-Object MklinkToolWin32+IoStatusBlock
         $deviceInfo = New-Object MklinkToolWin32+FileFsDeviceInformation
-        # 4 = FileFsDeviceInformation；结构体共 8 字节。
+        # 4 = FileFsDeviceInformation（8 字节）；7 = FileFsFullSizeInformation（32 字节）。
         $status = [MklinkToolWin32]::NtQueryVolumeInformationFile($handle, [ref]$ioStatus, [ref]$deviceInfo, 8, 4)
         if ($status -ne 0) {
-            throw ('无法确认来源所在的卷能否建立符号链接（查询设备信息失败，NTSTATUS 0x{0:X8}）：{1}' -f $status, $displayPath)
+            throw ('无法查询目录所在的卷（查询设备信息失败，NTSTATUS 0x{0:X8}）：{1}' -f $status, $displayPath)
+        }
+        $sizeInfo = New-Object MklinkToolWin32+FileFsFullSizeInformation
+        $status = [MklinkToolWin32]::NtQueryVolumeInformationFile($handle, [ref]$ioStatus, [ref]$sizeInfo, 32, 7)
+        if ($status -ne 0) {
+            throw ('无法查询目录所在的卷（查询可用空间失败，NTSTATUS 0x{0:X8}）：{1}' -f $status, $displayPath)
         }
         $fileSystemName = New-Object System.Text.StringBuilder 261
         [uint32]$serialNumber = 0
         [uint32]$maximumComponentLength = 0
         [uint32]$fileSystemFlags = 0
         if (-not [MklinkToolWin32]::GetVolumeInformationByHandleW($handle, $null, 0, [ref]$serialNumber, [ref]$maximumComponentLength, [ref]$fileSystemFlags, $fileSystemName, 261)) {
-            throw "无法确认来源所在的卷能否建立符号链接（查询卷信息失败，Win32 错误码 $([System.Runtime.InteropServices.Marshal]::GetLastWin32Error())）：$displayPath"
+            throw "无法查询目录所在的卷（查询卷信息失败，Win32 错误码 $([System.Runtime.InteropServices.Marshal]::GetLastWin32Error())）：$displayPath"
         }
+        # 0x10 = FILE_REMOTE_DEVICE：UNC 共享、映射的网络驱动器，以及经链接转到这些位置的路径。
+        $isRemote = (($deviceInfo.Characteristics -band 0x10) -ne 0)
         return [pscustomobject]@{
-            # 0x10 = FILE_REMOTE_DEVICE：UNC 共享、映射的网络驱动器，以及经链接转到这些位置的路径。
-            IsRemote = (($deviceInfo.Characteristics -band 0x10) -ne 0)
+            Path = $displayPath
+            IsRemote = $isRemote
+            # 与 GetDriveType 判为固定磁盘的依据相同：磁盘类设备（FILE_DEVICE_DISK 7、FILE_DEVICE_DISK_FILE_SYSTEM 8），
+            # 不是远程设备，也不是可移动介质（FILE_REMOVABLE_MEDIA 0x1）。经 SMB 访问的目录同样报告 7，只能靠远程标志区分（已实测）。
+            IsFixed = (($deviceInfo.DeviceType -eq 7 -or $deviceInfo.DeviceType -eq 8) -and -not $isRemote -and (($deviceInfo.Characteristics -band 0x1) -eq 0))
             FileSystem = $fileSystemName.ToString()
             Flags = $fileSystemFlags
+            SerialNumber = $serialNumber
+            # 当前账户可用的字节数（受磁盘配额限制），与 DriveInfo.AvailableFreeSpace 含义相同。
+            AvailableBytes = [long]$sizeInfo.CallerAvailableAllocationUnits * $sizeInfo.SectorsPerAllocationUnit * $sizeInfo.BytesPerSector
         }
     } finally {
         $handle.Dispose()
@@ -597,19 +616,25 @@ function Remove-TreeSafely([string]$Path, [ref]$ModificationStarted) {
     return $links.Count
 }
 
-function Get-DriveInfoForPath([string]$Path) {
-    $root = [System.IO.Path]::GetPathRoot((ConvertTo-FullPath $Path))
-    if ([string]::IsNullOrEmpty($root)) {
-        throw "无法识别目标所在卷：$Path"
+function Get-TargetVolumeInfo([string]$Target) {
+    # 目标实际所在的卷：从目标本身或其最近的已存在上级目录打开句柄查询（预检时目标还不存在）。目标路径经挂载文件夹、Junction
+    # 或目录符号链接落到别的卷时，按盘符判断会用错卷的可用空间与文件系统，指向网络共享的链接还会被当成本机固定磁盘（均已实测）。
+    # 路径中有悬空链接时句柄打不开，同样拒绝。
+    $probe = Get-ExtendedLengthPath $Target
+    while (-not [string]::IsNullOrEmpty($probe) -and -not [System.IO.Directory]::Exists($probe)) {
+        $probe = [System.IO.Path]::GetDirectoryName($probe)
     }
-    $drive = [System.IO.DriveInfo]::new($root)
-    if (-not $drive.IsReady) {
-        throw "目标所在卷不可用：$root"
+    if ([string]::IsNullOrEmpty($probe)) {
+        throw "目标所在的卷不存在或不可用：$Target"
     }
-    if ($drive.DriveType -ne [System.IO.DriveType]::Fixed) {
-        throw "目标必须位于本地固定磁盘：$root"
+    $volume = Get-DirectoryVolumeInfo $probe
+    if ($volume.IsRemote) {
+        throw "目标实际位于网络位置（UNC 共享、映射的网络驱动器，或路径中有指向网络的链接），只支持本机固定磁盘：$Target"
     }
-    return $drive
+    if (-not $volume.IsFixed) {
+        throw "目标必须位于本地固定磁盘：$Target"
+    }
+    return $volume
 }
 
 function Resolve-JobPaths([string]$SourceInput, [string]$TargetInput) {
@@ -653,7 +678,7 @@ function Get-MigrationAnalysis($Config) {
     $targetPaths = New-Object 'System.Collections.Generic.List[string]'
     $backupPaths = New-Object 'System.Collections.Generic.List[string]'
     $checkedIndices = New-Object 'System.Collections.Generic.List[int]'
-    $requiredByDrive = @{}
+    $requiredByVolume = @{}
     [long]$reserveBytes = 1GB
 
     $globalError = ''
@@ -698,7 +723,7 @@ function Get-MigrationAnalysis($Config) {
             if (Test-PathEntryExists $backup) {
                 throw "备份路径已经存在，请先处理该备份：$backup"
             }
-            $targetDrive = Get-DriveInfoForPath $target
+            $targetVolume = Get-TargetVolumeInfo $target
 
             [void]$sourcePaths.Add($source)
             [void]$targetPaths.Add($target)
@@ -731,12 +756,15 @@ function Get-MigrationAnalysis($Config) {
             }
             $analysis.Status = 'Ready'
 
-            $driveKey = $targetDrive.Name.ToUpperInvariant()
-            if (-not $requiredByDrive.ContainsKey($driveKey)) {
-                $requiredByDrive[$driveKey] = [ordered]@{ Drive = $targetDrive; Bytes = 0L; Indices = (New-Object 'System.Collections.Generic.List[int]') }
+            # 按卷序列号合并同一卷上各项的空间需求。不同的卷序列号相同（例如克隆出来的磁盘）时合在一起，按其中最小的可用空间比较：只会多拦，不会漏拦。
+            $volumeKey = [string]$targetVolume.SerialNumber
+            if (-not $requiredByVolume.ContainsKey($volumeKey)) {
+                $requiredByVolume[$volumeKey] = [ordered]@{ Volume = $targetVolume; Bytes = 0L; Indices = (New-Object 'System.Collections.Generic.List[int]') }
+            } elseif ([long]$targetVolume.AvailableBytes -lt [long]$requiredByVolume[$volumeKey].Volume.AvailableBytes) {
+                $requiredByVolume[$volumeKey].Volume = $targetVolume
             }
-            $requiredByDrive[$driveKey].Bytes += [long]$snapshot.TotalBytes
-            $requiredByDrive[$driveKey].Indices.Add($analyses.Count)
+            $requiredByVolume[$volumeKey].Bytes += [long]$snapshot.TotalBytes
+            $requiredByVolume[$volumeKey].Indices.Add($analyses.Count)
         } catch {
             $analysis.Status = 'Error'
             $analysis.Error = $_.Exception.Message
@@ -789,12 +817,12 @@ function Get-MigrationAnalysis($Config) {
         }
     }
 
-    foreach ($driveEntry in $requiredByDrive.Values) {
-        [long]$required = [long]$driveEntry.Bytes + $reserveBytes
-        if ([long]$driveEntry.Drive.AvailableFreeSpace -lt $required) {
-            $spaceError = "$($driveEntry.Drive.Name): 可用空间不足。需要约 $($driveEntry.Bytes) 字节并保留 1 GB，当前可用 $($driveEntry.Drive.AvailableFreeSpace) 字节。"
+    foreach ($volumeEntry in $requiredByVolume.Values) {
+        [long]$required = [long]$volumeEntry.Bytes + $reserveBytes
+        if ([long]$volumeEntry.Volume.AvailableBytes -lt $required) {
+            $spaceError = "$($volumeEntry.Volume.Path) 所在的卷可用空间不足。需要约 $($volumeEntry.Bytes) 字节并保留 1 GB，当前可用 $($volumeEntry.Volume.AvailableBytes) 字节。"
             [void]$errors.Add($spaceError)
-            foreach ($analysisIndex in $driveEntry.Indices) { Add-AnalysisError $analyses[$analysisIndex] $spaceError }
+            foreach ($analysisIndex in $volumeEntry.Indices) { Add-AnalysisError $analyses[$analysisIndex] $spaceError }
         }
     }
     if (-not [string]::IsNullOrEmpty($globalError)) {
@@ -855,8 +883,8 @@ function Compare-TreeSnapshots($SourceSnapshot, $TargetSnapshot, [bool]$IncludeH
 
 function Get-TimestampToleranceTicks([string]$TargetPath) {
     # 目标卷保存修改时间的精度：NTFS/ReFS 与来源完全一致；exFAT 为 10 ms；FAT32 以本地时间保存，
-    # 跨夏令时会差整小时，因此不比较（返回 -1）。
-    switch ([string](Get-DriveInfoForPath $TargetPath).DriveFormat) {
+    # 跨夏令时会差整小时，因此不比较（返回 -1）。按目标实际所在的卷判断，不看路径的盘符。
+    switch ([string](Get-TargetVolumeInfo $TargetPath).FileSystem) {
         'NTFS' { return 0L }
         'ReFS' { return 0L }
         'exFAT' { return [TimeSpan]::FromSeconds(2).Ticks }

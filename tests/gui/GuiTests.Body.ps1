@@ -266,13 +266,20 @@ try {
     Refresh-Grid
     $keepPermissionsCheckbox.Checked = $false
     Assert (-not (Get-WorkerConfig).KeepSourcePermissions) 'option off by default'
-    $script:PlanValid = $true
-    Assert ((Update-PermissionWarnings) -eq 1 -and $script:Jobs[0].PermissionWarning.Contains('目标沿用来源的访问权限')) 'unchecked: broad target location reported, hint names the option' $script:Jobs[0].PermissionWarning
+    # 模拟一次预检正常结束：Complete-WorkerAction 计算权限提示，并把它写入日志。
+    $logTextBox.Clear()
+    $script:WorkerState = $null
+    $script:WorkerAction = 'Analyze'
+    $script:ActiveJob = $true
+    Complete-WorkerAction 0
+    Assert ($script:PlanValid -and $script:Jobs[0].PermissionWarning.Contains('目标沿用来源的访问权限') -and $statusLabel.Text.Contains('1 项')) 'unchecked: broad target location reported after preflight, hint names the option' "$($statusLabel.Text) | $($script:Jobs[0].PermissionWarning)"
     $keepPermissionsCheckbox.Checked = $true
     Assert ([string]::IsNullOrEmpty($script:Jobs[0].PermissionWarning) -and $statusLabel.Text.StartsWith('预检通过。')) 'checked: hint cleared at once' $statusLabel.Text
     Assert ($script:PlanValid -and (Get-WorkerConfig).KeepSourcePermissions) 'plan still valid, option passed to the engine'
     $keepPermissionsCheckbox.Checked = $false
     Assert (-not [string]::IsNullOrEmpty($script:Jobs[0].PermissionWarning) -and $statusLabel.Text.Contains('1 项')) 'unchecked again: hint back' $statusLabel.Text
+    $loggedCount = [regex]::Matches($logTextBox.Text, [regex]::Escape($script:Jobs[0].PermissionWarning)).Count
+    Assert ($loggedCount -eq 1) 'hint logged once by the preflight, not again on every toggle' "occurrences=$loggedCount"
     $script:PlanValid = $false
 
     '[G7] the tool-directory warning carries a fix command, and running it clears the warning'

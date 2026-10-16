@@ -414,14 +414,15 @@ function Get-TargetPermissionWarning($Job) {
     }
 }
 
-function Update-PermissionWarnings {
+function Update-PermissionWarnings([switch]$WriteLog) {
     # 勾选“目标沿用来源的访问权限”时，目标根目录不继承目标位置的权限，这项提示不适用。
+    # 只有预检完成时才写入日志（-WriteLog）；切换复选框只更新表格提示，反复切换不会在日志里累积重复的行。
     $warningCount = 0
     foreach ($job in $script:Jobs) {
         $job.PermissionWarning = if ($keepPermissionsCheckbox.Checked) { '' } else { Get-TargetPermissionWarning $job }
         if (-not [string]::IsNullOrEmpty($job.PermissionWarning)) {
             $warningCount++
-            $logTextBox.AppendText("$($job.Source)：$($job.PermissionWarning)" + [Environment]::NewLine)
+            if ($WriteLog) { $logTextBox.AppendText("$($job.Source)：$($job.PermissionWarning)" + [Environment]::NewLine) }
         }
     }
     Refresh-Grid
@@ -782,7 +783,7 @@ function Complete-WorkerAction([int]$ExitCode, [string]$Message = '') {
         $startButton.Enabled = $script:PlanValid
         if ($script:PlanValid) {
             $script:LastAnalysisSignature = Get-CurrentSignature
-            $statusLabel.Text = Get-PreflightPassedText (Update-PermissionWarnings)
+            $statusLabel.Text = Get-PreflightPassedText (Update-PermissionWarnings -WriteLog)
         } else {
             $statusLabel.Text = '预检失败。请查看表格“状态”列的错误提示和日志。'
         }
@@ -1067,6 +1068,9 @@ function Get-WorkerCompletion {
             }
         } catch { }
     }
+    # 这里可以读 HasExited（与 Test-EngineRunning 不同）：$script:Worker 是 Connect-ElevatedWorker 中经 UAC 启动时 Start-Process 返回的对象，
+    # 持有启动时得到的句柄，.NET 直接用它查询（只需 PROCESS_QUERY_LIMITED_INFORMATION），不会像 Get-Process 得到的对象那样重新申请被完整性级别拒绝的权限。
+    # 提权实测（[X5]）确认 Worker 退出后能读到 True；这个句柄若缺查询权限，连接时读 Id 做 PID 校验就已失败，走不到这里。
     if ($null -ne $script:Worker) {
         $script:Worker.Refresh()
         if (-not $script:Worker.HasExited) { return $null }

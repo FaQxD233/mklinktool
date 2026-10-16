@@ -554,3 +554,85 @@ README（启动失败提示、来源卷的限制、D2 选项）、DESIGN（安�
 
 剩余边界：以另一个管理员账号提权（OTS）时，归主窗口用户所有的项引擎无权指定，仍为 Administrators 组，迁移后的 Git 仓库在普通权限下仍会被拒绝；来源中归 SYSTEM、TrustedInstaller 或其他账户所有的项同样保持默认所有者（与修复前相同）。
 - 仍需人工验证：OTS 提权、右键菜单弹出位置、启动时中断恢复提示的弹窗交互（同第 12.4 节）。
+
+---
+
+## 14. 第五轮：外部评审意见复核（2026-10-17）
+
+基线：commit `584f6be`，默认套件 192 项全部通过，提权模式 30 项。用户贴来一份评审意见（M1、M2、M3、L1、L2），本节逐条核实后给出方案。**本阶段未改动产品代码**；实测只在 scratchpad 与 `%TEMP%` 下的临时目录中进行（经 Junction 只读访问 `E:\testcode1`，没有写入），均已清理。
+
+### 14.1 核实结论
+
+| 编号 | 评审的说法 | 核实结果 | 建议 |
+|---|---|---|---|
+| M1 | 目标侧仍按路径文本判断卷：空间预检、修改时间容差、“本地固定磁盘”都可能用错卷（中） | **成立**（V9–V11）。三种后果都不会丢数据（失败都发生在来源改名之前），但会白做一次复制、把数据写满实际的目标卷，或让数据经链接落到网络位置。评审说的“反之（盘符所在卷是 FAT32、实际在 NTFS）则悄悄跳过时间比较”不会发生：FAT32/exFAT 不支持重解析点，路径无法从这类卷转到别的卷 | 修复（引擎） |
+| M2 | 跟踪模式用 `HasExited` 判断 Worker 退出；读取失败时恒为“仍在运行”，Worker 没写结果就退出会让界面永久锁定（中） | **功能上不成立**。`$script:Worker` 是 `Start-Process -Verb RunAs -PassThru` 返回的对象，持有 ShellExecuteEx 给的句柄，.NET 直接用这个句柄查询，不会像 `Get-Process` 得到的对象那样重新 `OpenProcess` 申请 `PROCESS_QUERY_INFORMATION`。评审要求的“真实提权环境实测”第 12.3 节已做过：[X5] 在提权模式下断言 Worker 退出后 `HasExited -eq $true`，10-16、10-17 两次提权运行均通过。V12 补充了机制：句柄只要有 `PROCESS_QUERY_LIMITED_INFORMATION` 就能正确读到；缺这个权限时确实会得到 `$null`，但那时 `Id` 也读不出来，`Connect-ElevatedWorker` 的 PID 校验先失败，根本进不了跟踪模式。真正的问题是 AGENTS.md 那条“不要读 `HasExited`”没写清适用范围（只针对 `Get-Process` 得到的提权进程），评审因此误判 | 不改逻辑；在 `Get-WorkerCompletion` 加注释，AGENTS.md 写清适用范围 |
+| M3 | 等待 Worker 回复时界面线程最长冻结 30 秒，建议把“接受确认”的等待降到 5 秒（低） | **描述属实，但没有已知的触发方式**。Worker 回复前只做 JSON 解析、会话路径校验和 `Start-Process`，正常不到 1 秒；Worker 崩溃或断开时读取立即返回（[F5-4]），不会等满 30 秒。缩短等待的代价是真实的：误判会进入跟踪模式，界面提示“未收到任务确认”，任务结束后 Worker 随之退出，下一次操作要再点一次 UAC。连接等待（含提权 PowerShell 启动）不能缩短 | 不改；把这条取舍写进 AGENTS.md，免得再被提出。若仍想缩短，建议改为 10 秒而不是 5 秒 |
+| L1 | 权限提示每次调用都写入日志，反复切换复选框会累积重复行（低） | **成立**：`Update-PermissionWarnings` 在预检完成时与每次切换“目标沿用来源的访问权限”时都会调用，每次都把提示追加进日志 | 修复（GUI） |
+| L2 | `Test-InterruptedMigration` 用 `Directory/File.Exists`，悬空链接被当成“原路径为空”，与引擎判据不一致，启动提示会反复出现（低） | **不成立**（V8）。.NET Framework 的 `Directory.Exists` 不跟随路径末段的链接（底层 `GetFileAttributesEx` 返回链接自身的属性）：悬空的 Junction 与目录符号链接都返回 True，普通路径与 `\\?\` 路径相同。主窗口判为“原路径有对象、不提示”，与引擎的 `Test-PathEntryExists` 一致；函数注释“原路径上什么都没有（包括失效链接）”与行为也相符 | 不改；把实测结论写进 AGENTS.md |
+
+### 14.2 本轮实测（PS 5.1，非提权）
+
+| 编号 | 用例 | 结果 |
+|---|---|---|
+| V8 | `%TEMP%` 下建 Junction 与目录符号链接，再删除它们的目标，旁边放一个 `_migration_backup` 目录 | 两种悬空链接：`Directory.Exists` 为 True、`File.Exists` 为 False、`GetAttributes` 为 `Directory, ReparsePoint`（普通路径与 `\\?\` 路径相同）。主窗口 `Test-InterruptedMigration` 为 False，引擎 `Test-PathEntryExists` 为 True；原路径确实不存在时两者分别为 True、False。判据一致 |
+| V9 | `%TEMP%\toE` 是指向 `E:\testcode1` 的 Junction，目标为 `toE\x\y` | `GetPathRoot` 为 `C:\`，`DriveInfo` 给出 C: 的可用空间约 7.0 GB；对 `toE` 打开句柄查询得到 E: 的卷序列号 `B6B8BB68` 与可用空间约 77.4 GB（`FileFsFullSizeInformation`，与 `GetDiskFreeSpaceEx` 一致） |
+| V10 | `%TEMP%\toShare` 是指向 `\\localhost\Users\…` 的目录符号链接 | `GetPathRoot` 为 `C:\`、`DriveInfo` 报 `Fixed`（现行代码会放行）；按句柄查询 `Characteristics` 为 0x10（`FILE_REMOTE_DEVICE`）。本机 NTFS 卷为 `DeviceType` 0x7（`FILE_DEVICE_DISK`）、`Characteristics` 0x20020 |
+| V11 | 修复方案的原型（下节的 `Get-TargetVolumeInfo`）跑六种目标 | 本地且父目录不存在：查询最近的已存在上级目录，得到 C:；经 Junction：得到 E:；UNC 目标与经符号链接到共享的目标：按网络位置拒绝；不存在的盘符、连不上的 UNC：按“卷不存在或不可用”拒绝；路径中有悬空 Junction：句柄打不开（Win32 错误码 2），拒绝 |
+| V12 | 给新建的 `Process` 对象挂上权限受限的句柄（模拟 Worker 的启动句柄），比较 `HasExited`、`WaitForExit(0)` 与 `Id` | `QUERY_LIMITED_INFORMATION \| SYNCHRONIZE`：运行中 False、退出后 True，`Id` 可读。只有 `SYNCHRONIZE`：运行中 False；退出后 `HasExited` 为 `$null`（`get_HasExited()` 报“拒绝访问”，属性读取把它吞掉了），同时 `Id` 读取失败；`WaitForExit(0)` 两种情况都正确 |
+
+### 14.3 修复方案
+
+**M1：目标按实际所在的卷检查（`migration-engine.ps1`，约 45 行）**
+- `MklinkToolWin32` 增加 `FileFsFullSizeInformation` 结构与对应的 `NtQueryVolumeInformationFile` 重载（信息类 7，32 字节）。
+- `Get-DirectoryVolumeInfo` 改为来源、目标两侧共用：在同一个句柄上再查一次可用空间，返回值增加 `Path`（查询的目录）、`IsFixed`、`SerialNumber`、`AvailableBytes`（当前账户可用的字节数，与 `DriveInfo.AvailableFreeSpace` 含义相同）。`IsFixed` 与 `GetDriveType` 判为固定磁盘的依据相同：磁盘类设备（`DeviceType` 为 7 或 8），且不是远程设备、不是可移动介质（`FILE_REMOVABLE_MEDIA` 0x1）。三条错误信息里的“无法确认来源所在的卷能否建立符号链接”改为不分来源、目标的“无法查询目录所在的卷”（错误信息带有路径，仍能看出是哪一侧）。`Assert-SourceVolumeCanHoldLink` 不变，[E18] 的注入锚点不受影响。
+- 新增 `Get-TargetVolumeInfo`，替换 `Get-DriveInfoForPath`：从目标本身开始向上找到最近的已存在目录（预检时目标还不存在），按句柄查询；网络位置拒绝，并写明原因；不是本地固定磁盘拒绝（策略不变，只是按实际的卷判断）；一路找不到已存在的目录时，报“目标所在的卷不存在或不可用”。路径中有悬空链接时，句柄打不开，同样拒绝（fail-closed）。
+- `Get-MigrationAnalysis`：按卷序列号合并同一卷上各项的空间需求（原来按盘符）。不同的卷序列号相同（例如克隆出来的磁盘）时，合在一起按其中最小的可用空间比较，只会多拦、不会漏拦。空间不足的提示改为写出查询的目录，例如“`D:\Migrated` 所在的卷可用空间不足……”，顺带去掉原来“`C:\:`”多出的冒号。
+- `Get-TimestampToleranceTicks`：文件系统改取自 `Get-TargetVolumeInfo`（此时目标已存在，查询的就是目标本身）。
+- 不改：目标仍要求本地固定磁盘（来源一侧在第 13 节已放宽为可移动 NTFS，目标侧策略本轮不动）；不新增“目标卷只读”的检查（只读卷在复制前创建目录时就会失败，来源不受影响）。
+
+**L1：权限提示只在预检完成时写入日志（`migrate-local-folders.ps1`，约 4 行）**
+- `Update-PermissionWarnings` 增加开关参数 `-WriteLog`，只有 `Complete-WorkerAction` 处理预检结果时传入。切换复选框时只更新表格提示与状态栏。
+- 取舍：预检时勾选、事后再取消勾选的情况下，提示只出现在表格与状态栏、不进日志。状态栏本来就指向“悬停‘状态’列查看”，开始迁移时日志也会被清空，不再为这种情况另外记状态。
+
+**M2、M3、L2：不改逻辑，只补说明**
+- M2：`Get-WorkerCompletion` 读 Worker 退出状态处加注释，说明读的是启动句柄、为什么可靠、有哪项提权实测为证。不把这里及另外 4 处对启动句柄的 `HasExited` 统一改成 `WaitForExit(0)`：行为相同，却要再跑一次需要点 UAC 的提权测试才能确认。
+- M3、L2：只写进 AGENTS.md（见 14.5）。
+
+### 14.4 测试
+
+- 引擎新增 [E20]“目标按实际所在的卷检查”：
+  - (a) 网络位置：UNC 目标与“经指向共享的目录符号链接”的目标都在预检时被拒绝并写明是网络位置，同批的本地目标照常通过。没有 `\\localhost\Users` 共享时输出 SKIP（同 [E17]）。修复前，经符号链接的那一项会被当成固定磁盘放行。
+  - (b) 经 Junction 到另一块本机卷：Junction 指向仓库所在目录（只读使用，Analyze 不写目标），注入一行日志记下查询到的卷序列号，断言它等于 `vol <仓库所在盘>` 的序列号、不等于 `%TEMP%` 所在卷的。仓库与 `%TEMP%` 在同一卷上时输出 SKIP。
+  - (c) 注入目标卷信息（本机三个卷都是 NTFS 固定磁盘）：不是固定磁盘时拒绝并写明“本地固定磁盘”；可用空间只有 1 字节时报空间不足，提示中带查询的目录；文件系统为 FAT32 时 Migrate 照常完成，日志写明不比较修改时间（证明容差取自实际的卷）。
+- GUI [G6] 补断言：模拟预检完成（`Complete-WorkerAction`）后反复切换复选框，日志里同一条权限提示只出现一次。
+- 运行 `tests\Invoke-AllTests.ps1`（预计 192 项增至约 200 项）。本轮不涉及 Worker 与提权路径，提权模式（`-IncludeElevated`，需要点一次 UAC）不是必需的。
+
+### 14.5 文档
+
+- README：预检一节写明目标按实际所在的卷检查（经挂载文件夹、Junction 或目录符号链接时，按它们指向的卷）：必须是本机固定磁盘，网络位置拒绝，可用空间按实际的卷计算；修改时间容差同样按实际的卷。
+- DESIGN：安全决策表增加“预检按目标实际所在的卷检查”一行；“按目标所在本地卷检查可用空间”一句与“失败和中断”一节相应更新；新增变更历史条目，写明 M2、M3、L2 不改的理由。
+- AGENTS：架构速览中的 Analyze 补上 `Get-TargetVolumeInfo`；“卷与网络位置”补 V9、V10；GUI 一节把“不要读 `HasExited`”限定为 `Get-Process` 得到的提权进程，并说明启动句柄为什么可以读（V12、[X5]），再加一条 M3 的取舍；“文件系统”一节补 V8（`Directory.Exists` 对悬空链接返回 True）；测试清单补 [E20]，更新用例总数；已知边界补“目标必须是本机固定磁盘，按实际所在的卷判断”。
+- PROJECT_OVERVIEW：预检描述与测试索引同步。
+- 本节补执行记录。
+
+### 14.6 需要确认
+
+1. 范围：只修 M1、L1；M2、M3、L2 按 14.1 的理由不改代码、只补文档。
+2. M1 保持“目标必须是本地固定磁盘”的现有策略，只改为按实际的卷判断；目标位于可移动磁盘仍会被拒绝。
+3. M3 维持 30 秒。若你更在意“窗口卡住”的观感，可改为 10 秒，代价见 14.1。
+
+### 14.7 执行记录（2026-10-17）
+
+用户确认三点都按建议：只修 M1、L1；目标仍要求本地固定磁盘；M3 维持 30 秒。
+
+| 编号 | 改动 | 验证（PS 5.1，非提权 + 开发者模式） |
+|---|---|---|
+| M1 | 引擎：`MklinkToolWin32` 增加 `FileFsFullSizeInformation` 与对应的 `NtQueryVolumeInformationFile` 重载；`Get-DirectoryVolumeInfo` 改为两侧共用，增加 `Path`、`IsFixed`、`SerialNumber`、`AvailableBytes`，错误信息不再限定“来源”；新增 `Get-TargetVolumeInfo` 替换 `Get-DriveInfoForPath`；预检按卷序列号合并空间需求（序列号相同取最小的可用空间），提示写出查询的目录；`Get-TimestampToleranceTicks` 改用实际的文件系统 | 引擎 [E20] 9 项：UNC 目标与经指向共享的符号链接的目标被拒绝，同批的本地目标通过；经 Junction 指向仓库所在的 E:，查询到的卷序列号与 `vol E:` 一致（`B6B8BB68`），不是 `%TEMP%` 所在的 C:，Junction 后面没有创建任何东西；注入非固定磁盘、1 字节可用空间、FAT32 三种卷信息，分别被拒绝、报空间不足（提示中带查询的目录）、迁移完成且日志写明不比较修改时间。用修复前的引擎跑同一组用例：经符号链接到共享的目标被判为“预检通过”，UNC 目标报的是 .NET 的 “Object must be a root directory”，两项失败 |
+| L1 | GUI：`Update-PermissionWarnings` 增加 `-WriteLog`，只有预检完成时（`Complete-WorkerAction`）才写日志 | GUI [G6] 改为经 `Complete-WorkerAction` 模拟预检完成，再反复切换复选框：日志里同一条提示只出现一次。修复前的 GUI 出现两次，断言失败 |
+| M2 | GUI：`Get-WorkerCompletion` 读 Worker 退出状态处加注释，说明为什么可以读启动句柄的 `HasExited` | — |
+| 文档 | README（预检、修改时间容差）、DESIGN（安全决策表、失败和中断、变更历史）、AGENTS（架构速览、文件系统、卷与网络位置、GUI、测试、已知边界）、PROJECT_OVERVIEW | — |
+
+默认套件 202 项全部通过（静态 27、引擎 74、GUI（假 Worker）58、GUI（真实 Worker）38、启动 5），约 72 秒。本轮没有改动 Worker 与提权路径，没有运行提权模式。
+
+**实施中踩到的问题**：给 `Get-WorkerCompletion` 加的注释第一版原样写了 `Start-Process -Verb RunAs -PassThru`。`Test-Gui.ps1 -Mode RealWorker` 要在 GUI 副本中替换 ` -Verb RunAs`，并要求它只出现一次，于是这组测试整组没有运行（报 found 2）。注释改写后恢复正常；AGENTS 的测试说明里补了提醒：产品代码的注释不要原样重复测试要替换的文本。

@@ -117,6 +117,20 @@ function Get-UncPathForLocal([string]$Path) {
     return ''
 }
 
+function Get-VolumeSerial([string]$Path) {
+    # 用 vol 命令取路径所在盘的卷序列号（与引擎的查询方式无关，作对照），返回 8 位十六进制；取不到时返回空串。
+    # 序列号在卷标之后输出，取最后一个匹配，卷标本身像序列号时也不会取错。
+    $output = (& cmd.exe /c vol ([System.IO.Path]::GetPathRoot($Path).TrimEnd('\'))) | Out-String
+    $found = [regex]::Matches($output, '([0-9A-F]{4})-([0-9A-F]{4})')
+    if ($found.Count -eq 0) { return '' }
+    return $found[$found.Count - 1].Groups[1].Value + $found[$found.Count - 1].Groups[2].Value
+}
+
+function New-TargetVolumeInjection([string]$IsFixed = '$true', [string]$FileSystem = 'NTFS', [string]$AvailableBytes = '1TB') {
+    # 替换 Get-TargetVolumeInfo 查询到的卷信息（本机的卷都是 NTFS 固定磁盘）；Path 用本机不存在的目录，便于在提示中认出它。
+    return "`$volume = [pscustomobject]@{ Path = 'X:\injected'; IsRemote = `$false; IsFixed = $IsFixed; FileSystem = '$FileSystem'; Flags = [uint32]0; SerialNumber = [uint32]1; AvailableBytes = [long]$AvailableBytes }"
+}
+
 # 下面的注入代码在引擎的 Invoke-Migration 作用域内运行，可直接使用 $source、$backup。
 $writeSourceSameSize = "[System.IO.File]::WriteAllText((Join-Path `$source 'a.txt'), 'ZZZZZ'); [System.IO.File]::SetLastWriteTimeUtc((Join-Path `$source 'a.txt'), [DateTime]::UtcNow)"
 $writeBackupSameSize = "[System.IO.File]::WriteAllText((Join-Path `$backup 'a.txt'), 'ZZZZZ'); [System.IO.File]::SetLastWriteTimeUtc((Join-Path `$backup 'a.txt'), [DateTime]::UtcNow)"
@@ -346,6 +360,60 @@ try {
     Assert (-not $targetFileSecurity.AreAccessRulesProtected -and (Get-AccessRuleSet (Join-Path $keptTarget 'a.txt')) -eq $sourceFileRules) 'copied file inherits normally and matches a file of the source'
     $r = Invoke-Engine $caseDir 'Migrate' @([pscustomobject]@{ Source = $plainSource; Target = (Join-Path $broadParent 'plain') })
     Assert ($r.ExitCode -eq 0 -and (Get-AccessRuleSet (Join-Path $broadParent 'plain')).Contains('S-1-5-32-545|')) 'without the option the target inherits the target location as before' "exit=$($r.ExitCode)"
+
+    '[E20] The target is checked on the volume it actually lands on, not by the drive letter of its path'
+    $caseDir = New-Case 'e20'
+    $caseUnc = Get-UncPathForLocal $caseDir
+    if ([string]::IsNullOrEmpty($caseUnc)) {
+        '  SKIP (network part) no \\localhost\Users share reaching the test directory'
+    } else {
+        $sources = @('unc', 'local', 'linked' | ForEach-Object { Join-Path $caseDir "src\$_" })
+        foreach ($source in $sources) { New-SourceTree $source }
+        [void][System.IO.Directory]::CreateDirectory((Join-Path $caseDir 'real'))
+        $jobs = @(
+            [pscustomobject]@{ Source = $sources[0]; Target = (Join-Path $caseUnc 'real\unc') },
+            [pscustomobject]@{ Source = $sources[1]; Target = (Join-Path $caseDir 'dst\local') })
+        # 目录符号链接指向共享：路径以本机固定磁盘的盘符开头，按盘符判断会被放行（修复前的行为）。
+        $null = & cmd.exe /c mklink /D (Join-Path $caseDir 'share-link') (Join-Path $caseUnc 'real')
+        $haveLink = [System.IO.Directory]::Exists((Join-Path $caseDir 'share-link'))
+        if ($haveLink) { $jobs += [pscustomobject]@{ Source = $sources[2]; Target = (Join-Path $caseDir 'share-link\linked') } } else { '  SKIP (link part) could not reach the share through a directory symbolic link' }
+        $r = Invoke-Engine $caseDir 'Analyze' $jobs
+        $items = @($r.State.Jobs)
+        Assert ($r.ExitCode -eq 1 -and $items[0].Status -eq 'Error' -and $items[0].Error.Contains('网络位置')) 'UNC target refused' "exit=$($r.ExitCode) status=$($items[0].Status) error=$($items[0].Error)"
+        Assert ($items[1].Status -eq 'Ready') 'local target in the same batch still passes' "$($items[1].Status) $($items[1].Error)"
+        if ($haveLink) { Assert ($items[2].Status -eq 'Error' -and $items[2].Error.Contains('网络位置')) 'target reached through a link to a share refused' "$($items[2].Status) $($items[2].Error)" }
+    }
+
+    $caseDir = New-Case 'e20-junction'
+    $repoRoot = Split-Path -Parent $PSScriptRoot
+    $repoSerial = Get-VolumeSerial $repoRoot
+    $tempSerial = Get-VolumeSerial $caseDir
+    if ([string]::IsNullOrEmpty($repoSerial) -or [string]::IsNullOrEmpty($tempSerial) -or $repoSerial -eq $tempSerial) {
+        '  SKIP (junction part) the repository is not on another volume than %TEMP%'
+    } else {
+        # Junction 指向仓库所在目录（只读使用：预检不创建目标）；引擎注入一行日志，记下它查询到的卷序列号。
+        $toOtherVolume = Join-Path $caseDir 'to-repo-volume'
+        New-Junction $toOtherVolume $repoRoot
+        $source = Join-Path $caseDir 'src\data'
+        New-SourceTree $source
+        $target = Join-Path $toOtherVolume ('mkl-engine-test-' + [guid]::NewGuid().ToString('N') + '\data')
+        $r = Invoke-Engine $caseDir 'Analyze' @([pscustomobject]@{ Source = $source; Target = $target }) -Anchor '$targetVolume = Get-TargetVolumeInfo $target' -Injection "Write-Log ('TEST target volume serial {0:X8}' -f `$targetVolume.SerialNumber)" -Mode After
+        $queriedSerial = if ($r.Log -match 'TEST target volume serial ([0-9A-F]{8})') { $Matches[1] } else { '' }
+        Assert ($r.ExitCode -eq 0 -and @($r.State.Jobs)[0].Status -eq 'Ready') 'target behind a junction to another volume passes preflight' "exit=$($r.ExitCode) error=$(@($r.State.Jobs)[0].Error)"
+        Assert ($queriedSerial -eq $repoSerial) 'the volume queried is the one the junction leads to, not the drive of the path' "queried=$queriedSerial junction volume=$repoSerial path drive=$tempSerial"
+        Assert (-not [System.IO.Directory]::Exists((Split-Path -Parent $target))) 'nothing created behind the junction'
+    }
+
+    $targetVolumeAnchor = '$volume = Get-DirectoryVolumeInfo $probe'
+    $r = Invoke-EngineCase 'e20-removable' -Action 'Analyze' -Anchor $targetVolumeAnchor -Injection (New-TargetVolumeInjection -IsFixed '$false') -Mode After
+    $job = @($r.State.Jobs)[0]
+    Assert ($r.ExitCode -eq 1 -and $job.Status -eq 'Error' -and $job.Error.Contains('本地固定磁盘')) 'target on a volume that is not a fixed disk refused' "exit=$($r.ExitCode) error=$($job.Error)"
+    $r = Invoke-EngineCase 'e20-space' -Action 'Analyze' -Anchor $targetVolumeAnchor -Injection (New-TargetVolumeInjection -AvailableBytes '1') -Mode After
+    $job = @($r.State.Jobs)[0]
+    Assert ($r.ExitCode -eq 1 -and $job.Error.Contains('可用空间不足') -and $job.Error.Contains('X:\injected')) 'free space taken from the queried volume, message names the queried directory' "exit=$($r.ExitCode) error=$($job.Error)"
+    $r = Invoke-EngineCase 'e20-fat32' -Anchor $targetVolumeAnchor -Injection (New-TargetVolumeInjection -FileSystem 'FAT32') -Mode After
+    $job = @($r.State.Jobs)[0]
+    Assert ($r.ExitCode -eq 0 -and $job.Status -eq 'Complete' -and $r.Log.Contains('不比较修改时间')) 'time tolerance follows the queried volume (FAT32: not compared)' "exit=$($r.ExitCode) status=$($job.Status) error=$($job.Error)"
 } catch {
     "TEST ERROR: $($_.Exception.Message) at line $($_.InvocationInfo.ScriptLineNumber)"
     $script:TestFail++
